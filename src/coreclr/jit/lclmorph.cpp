@@ -868,7 +868,8 @@ class LocalAddressVisitor final : public GenTreeVisitor<LocalAddressVisitor>
     bool                            m_stmtModified            = false;
     bool                            m_stmtSideEffectsModified = false;
     bool                            m_madeChanges             = false;
-    bool                            m_propagatedAddrs         = false;
+    bool                            m_removedUnusedValues     = false;
+    bool                            m_stmtHasExposedAddress   = false;
     LocalSequencer*                 m_sequencer;
     LocalEqualsLocalAddrAssertions* m_lclAddrAssertions;
 
@@ -893,9 +894,9 @@ public:
         return m_madeChanges;
     }
 
-    bool PropagatedAnyAddresses() const
+    bool RemovedUnusedValues() const
     {
-        return m_propagatedAddrs;
+        return m_removedUnusedValues;
     }
 
     void VisitStmt(Statement* stmt)
@@ -910,6 +911,7 @@ public:
 
         m_stmtModified            = false;
         m_stmtSideEffectsModified = false;
+        m_stmtHasExposedAddress   = false;
 
         if (m_sequencer != nullptr)
         {
@@ -1484,6 +1486,32 @@ private:
         {
             INDEBUG(val.Consume();)
         }
+
+        // Revisit discarded values only in statements local morph changed. Reuse the
+        // existing side-effect extractor and statement repair.
+        GenTree* tree = val.Node();
+        if (m_stmtModified && (m_lclAddrAssertions != nullptr) && !tree->TypeIs(TYP_VOID) && tree->IsValue() &&
+            !tree->OperIsConst() && IsUnused(tree, user))
+        {
+            genTreeOps oper = tree->OperGet();
+            var_types  type = tree->TypeGet();
+            GenTreeFlags oldEffects = tree->gtFlags & GTF_OBS_EFFECT;
+            m_compiler->gtUpdateNodeSideEffects(tree);
+            bool effectsChanged = oldEffects != (tree->gtFlags & GTF_OBS_EFFECT);
+
+            GenTree* effects = nullptr;
+            m_compiler->gtExtractSideEffList(tree, &effects, GTF_OBS_EFFECT);
+            if ((effects != tree) || (tree->OperGet() != oper) || (tree->TypeGet() != type))
+            {
+                JITDUMP("Removing unused value [%06u] during local morph\n", m_compiler->dspTreeID(tree));
+                *val.Use()            = (effects != nullptr) ? effects : m_compiler->gtNewNothingNode();
+                m_stmtModified        = true;
+                m_removedUnusedValues |= m_stmtHasExposedAddress;
+                effectsChanged = true;
+            }
+
+            m_stmtSideEffectsModified |= effectsChanged;
+        }
     }
 
     //------------------------------------------------------------------------
@@ -1564,6 +1592,7 @@ private:
 
         if (escapeAddr)
         {
+            m_stmtHasExposedAddress = true;
             unsigned exposedLclNum = varDsc->lvIsStructField ? varDsc->lvParentLcl : lclNum;
 
             if (m_lclAddrAssertions != nullptr)
@@ -2299,7 +2328,6 @@ private:
             DBEXEC(VERBOSE, assertion->Print());
             JITDUMP("\n");
             value.Address(assertion->AddressLclNum, assertion->AddressOffset);
-            m_propagatedAddrs = true;
         }
     }
 
@@ -2436,7 +2464,7 @@ PhaseStatus Compiler::fgLocalMorph()
 
         madeChanges = visitor.MadeChanges();
 
-        madeChanges |= fgExposeUnpropagatedLocals(visitor.PropagatedAnyAddresses(), &assertions);
+        madeChanges |= fgExposeUnpropagatedLocals(visitor.RemovedUnusedValues(), &assertions);
     }
 
     return madeChanges ? PhaseStatus::MODIFIED_EVERYTHING : PhaseStatus::MODIFIED_NOTHING;
@@ -2648,24 +2676,47 @@ PhaseStatus Compiler::fgUnpinNonMovableLocals()
 //   taken. Deletes LCL_ADDR nodes used as the data source of a store if the
 //   destination can be proven to not be read, and avoid exposing these if
 //   possible.
+//   Also recomputes exposure when local morph removed discarded expressions.
 //
 // Argument:
-//    propagatedAny - Whether any LCL_ADDR values were propagated
+//    removedUnusedValues - Whether discarded expressions were simplified during local morph
 //    assertions    - Data structure tracking LCL_ADDR assertions
 //
 // Return Value:
 //    True if any changes were made to the IR; otherwise false.
 //
-bool Compiler::fgExposeUnpropagatedLocals(bool propagatedAny, LocalEqualsLocalAddrAssertions* assertions)
+bool Compiler::fgExposeUnpropagatedLocals(bool removedUnusedValues, LocalEqualsLocalAddrAssertions* assertions)
 {
-    if (!propagatedAny)
+    BitVecTraits localsTraits(lvaCount, this);
+    if (BitVecOps::IsEmpty(&localsTraits, assertions->GetLocalsToExpose()))
+    {
+        return false;
+    }
+
+    BitVec unreadLocals = assertions->GetLocalsWithAssertions();
+
+    BitVecOps::Iter iter(&localsTraits, unreadLocals);
+    unsigned        lclNum;
+    while (iter.NextElem(&lclNum))
+    {
+        LclVarDsc* dsc = lvaGetDesc(lclNum);
+        // IR reads do not account for implicit runtime uses or GC pinning. Conservatively
+        // retain parameters too: jmp forwarding and generic-context reporting may require
+        // them, and their implicit-reference flags can be set after local morph.
+        if (dsc->lvIsParam || dsc->lvImplicitlyReferenced || dsc->lvPinned)
+        {
+            BitVecOps::RemoveElemD(&localsTraits, unreadLocals, lclNum);
+        }
+    }
+
+    // An address stored in an unread temporary need not have been propagated.
+    // The recorded definitions, not successful propagation, determine whether
+    // the existing local-use scan has work to do.
+    if (BitVecOps::IsEmpty(&localsTraits, unreadLocals) && !removedUnusedValues)
     {
         fgExposeLocalsInBitVec(assertions->GetLocalsToExpose());
         return false;
     }
-
-    BitVecTraits localsTraits(lvaCount, this);
-    BitVec       unreadLocals = assertions->GetLocalsWithAssertions();
 
     struct Store
     {
@@ -2707,14 +2758,14 @@ bool Compiler::fgExposeUnpropagatedLocals(bool propagatedAny, LocalEqualsLocalAd
         }
     }
 
-    if (BitVecOps::IsEmpty(&localsTraits, unreadLocals))
+    if (BitVecOps::IsEmpty(&localsTraits, unreadLocals) && !removedUnusedValues)
     {
         JITDUMP("No destinations of propagated LCL_ADDR nodes are unread\n");
         fgExposeLocalsInBitVec(assertions->GetLocalsToExpose());
         return false;
     }
 
-    bool changed = false;
+    bool changed = removedUnusedValues;
     for (const Store& store : stores.BottomUpOrder())
     {
         if (BitVecOps::IsMember(&localsTraits, unreadLocals, store.LclNum))

@@ -79,6 +79,51 @@ public class P
     {
         return v1 + v2;
     }
+
+    private static int s_trace;
+
+    [Fact]
+    public static void UnreadAddressStores()
+    {
+        s_trace = 0;
+        Assert.Equal(7, UnreadAddressStore(7));
+        Assert.Equal(3, s_trace);
+        Assert.Equal(10, UnreadSpanAddressStore(new[] { 7, 8, 9 }));
+        Assert.Equal(34, s_trace);
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static int Touch(int digit)
+    {
+        s_trace = s_trace * 10 + digit;
+        return digit;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static bool Never() => false;
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static int UnreadAddressStore(int value)
+    {
+        ref int alias = ref value;
+        if (Never())
+            alias++;
+        Touch(3);
+        return value;
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static int UnreadSpanAddressStore(int[] values)
+    {
+        Span<int> span = values;
+        ref Span<int> alias = ref span;
+        if (Never())
+            alias = default;
+        // Once the branch folds away, the unread alias must not expose the span.
+        Touch(4);
+        return span.Length + span[0];
+    }
+
 }
 
 
