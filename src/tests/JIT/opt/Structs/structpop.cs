@@ -79,6 +79,82 @@ public class P
     {
         return v1 + v2;
     }
+
+    private static int s_trace;
+
+    [Fact]
+    public static void UnreadAddressStores()
+    {
+        s_trace = 0;
+        Assert.Equal(7, UnreadAddressStore(7));
+        Assert.Equal(3, s_trace);
+        Assert.Equal(10, UnreadSpanAddressStore(new[] { 7, 8, 9 }));
+        Assert.Equal(34, s_trace);
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static int Touch(int digit)
+    {
+        s_trace = s_trace * 10 + digit;
+        return digit;
+    }
+
+    [MethodImpl(MethodImplOptions.AggressiveInlining)]
+    private static bool Never() => false;
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static int UnreadAddressStore(int value)
+    {
+        ref int alias = ref value;
+        if (Never())
+            alias++;
+        Touch(3);
+        return value;
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static int UnreadSpanAddressStore(int[] values)
+    {
+        Span<int> span = values;
+        ref Span<int> alias = ref span;
+        if (Never())
+            alias = default;
+        // Once the branch folds away, the unread alias must not expose the span.
+        Touch(4);
+        return span.Length + span[0];
+    }
+
+    private struct SpanStub
+    {
+        public int Length;
+        public int Value;
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public int Slice(int start, int length)
+        {
+            if ((uint)start > (uint)Length || (uint)length > (uint)(Length - start))
+                throw new ArgumentOutOfRangeException();
+            return length;
+        }
+    }
+
+    [Fact]
+    public static void DiscardedSliceReceiverAddress()
+    {
+        Assert.Equal(13, SliceLength(new SpanStub { Length = 10, Value = 7 }));
+        Assert.Equal(7, SliceLength(new SpanStub { Length = 4, Value = 7 }));
+        Assert.Equal(0, SliceLength(new SpanStub { Length = 3, Value = 7 }));
+    }
+
+    [MethodImpl(MethodImplOptions.NoInlining)]
+    private static int SliceLength(SpanStub span)
+    {
+        // Folding the first unsigned check leaves a discarded receiver field address.
+        // Removing it lets the second check use the facts about span.Length.
+        // CHECK-NOT: CORINFO_HELP_THROW
+        ref SpanStub alias = ref span;
+        if (alias.Length < 4)
+            return 0;
+        return alias.Slice(0, alias.Length - 4) + span.Value;
+    }
 }
-
-
