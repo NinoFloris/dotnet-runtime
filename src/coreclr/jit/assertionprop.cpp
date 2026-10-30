@@ -4625,6 +4625,30 @@ ValueNum Compiler::optGetPreferredBoundForRange(ValueNum vn, ASSERT_VALARG_TP as
 }
 
 //------------------------------------------------------------------------
+// IsKnownNonNegative: Check whether an int32 expression is known to be nonnegative.
+//
+// Arguments:
+//    comp       - Compiler instance.
+//    tree       - Expression to check.
+//    assertions - Set of live assertions at the expression.
+//
+// Returns:
+//    True if the expression's shape or its asserted range proves it nonnegative.
+//
+static bool IsKnownNonNegative(Compiler* comp, GenTree* tree, ASSERT_VALARG_TP assertions)
+{
+    assert(tree->TypeIs(TYP_INT));
+
+    if (tree->IsNeverNegative(comp))
+    {
+        return true;
+    }
+
+    Range range = RangeCheck::GetRangeFromAssertions(comp, tree, assertions);
+    return range.LowerLimit().IsConstant() && (range.LowerLimit().GetConstant() >= 0);
+}
+
+//------------------------------------------------------------------------
 // optAssertionProp: try and optimize a relop via assertion propagation
 //
 // Arguments:
@@ -4685,7 +4709,7 @@ GenTree* Compiler::optAssertionPropGlobal_RelOp(ASSERT_VALARG_TP assertions,
         }
     }
 
-    // Check if we have an assertion that exactly matches the relop.
+    // Check if an existing assertion determines the result of this comparison.
     ValueNum relopVN = optConservativeNormalVN(tree);
     ValueNum op1VN   = optConservativeNormalVN(op1);
     ValueNum op2VN   = optConservativeNormalVN(op2);
@@ -4699,7 +4723,7 @@ GenTree* Compiler::optAssertionPropGlobal_RelOp(ASSERT_VALARG_TP assertions,
         {
             const AssertionDsc& curAssertion = optGetAssertion(GetAssertionIndex(index));
 
-            // Look for a relop-like assertion that matches the current relop exactly.
+            // Look for a relop-like assertion with the same operands and comparison (or its inverse).
             // Example: currentTree is "X >= Y" and we have an assertion "X >= Y" (or its inverse "X < Y").
             //
             // For O2K_VN_ADD_CNS the assertion stores op2 as "vn + cns".
@@ -4713,10 +4737,22 @@ GenTree* Compiler::optAssertionPropGlobal_RelOp(ASSERT_VALARG_TP assertions,
                 bool       isUnsigned;
                 genTreeOps assertionOper = AssertionDsc::ToCompareOper(curAssertion.GetKind(), &isUnsigned);
 
-                if (tree->OperIs(assertionOper, GenTree::ReverseRelop(assertionOper)) &&
-                    (tree->IsUnsigned() == isUnsigned))
+                if (tree->OperIs(assertionOper, GenTree::ReverseRelop(assertionOper)))
                 {
-                    newTree = gtNewIconNode(tree->OperIs(assertionOper) ? 1 : 0);
+                    bool compatibleSignedness = tree->IsUnsigned() == isUnsigned;
+                    if (!compatibleSignedness && op1->TypeIs(TYP_INT) && op2->TypeIs(TYP_INT))
+                    {
+                        // Signed and unsigned ordering agree when both operands are nonnegative.
+                        // Keep the relationship from the assertion: individual operand ranges
+                        // may overlap even when the comparison is already known to hold.
+                        compatibleSignedness =
+                            IsKnownNonNegative(this, op1, assertions) && IsKnownNonNegative(this, op2, assertions);
+                    }
+
+                    if (compatibleSignedness)
+                    {
+                        newTree = gtNewIconNode(tree->OperIs(assertionOper) ? 1 : 0);
+                    }
                 }
             }
             // "X < Y" implies "(X + 1) <= Y" as "X + 1" can't overflow, e.g. "(uint)(i + 1) > (uint)len"
