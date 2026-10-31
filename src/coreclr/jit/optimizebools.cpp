@@ -658,6 +658,7 @@ bool FoldNeverNegativeRangeTest(
 //    fold them into a single compare node if possible, e.g.:
 //      1) "X >= 10 && X <= 100" -> "(X - 10) u<= 90"
 //      2) "X >= 0 && X <= 100"  -> "X u<= 100"
+//      3) "X u>= 10 && (X - 10) u>= 20" -> "X u>= 30"
 //    where 'u' stands for unsigned comparison. cmp1 is used as the target node for folding.
 //    It's also guaranteed to be first in the execution order (so can allow some side effects).
 //
@@ -680,8 +681,8 @@ bool FoldRangeTests(Compiler* comp, GenTreeOp* cmp1, bool cmp1IsReversed, GenTre
     genTreeOps     cmp1Op;
     genTreeOps     cmp2Op;
 
-    // Make sure both conditions are constant range checks with matching signedness, e.g. "X > CNS".
-    if ((cmp1->IsUnsigned() != cmp2->IsUnsigned()) || !IsConstantRangeTest(cmp1, &var1Node, &cns1Node, &cmp1Op) ||
+    // Make sure both conditions are constant range checks, e.g. "X > CNS".
+    if (!IsConstantRangeTest(cmp1, &var1Node, &cns1Node, &cmp1Op) ||
         !IsConstantRangeTest(cmp2, &var2Node, &cns2Node, &cmp2Op))
     {
         // Give FoldNeverNegativeRangeTest a try when the constant range fold does not apply.
@@ -691,6 +692,51 @@ bool FoldRangeTests(Compiler* comp, GenTreeOp* cmp1, bool cmp1IsReversed, GenTre
     // Reverse the comparisons if necessary so we'll get a canonical form "cond1 == true && cond2 == true" -> InRange.
     cmp1Op = cmp1IsReversed ? GenTree::ReverseRelop(cmp1Op) : cmp1Op;
     cmp2Op = cmp2IsReversed ? GenTree::ReverseRelop(cmp2Op) : cmp2Op;
+
+    // Fold X >= A && X - A >= B into X >= A + B for nonnegative int32 constants.
+    if (var2Node->OperIs(GT_ADD, GT_SUB))
+    {
+        ssize_t a = cns1Node->IconValue();
+        ssize_t b = cns2Node->IconValue();
+        if ((cmp1Op != GT_GE) || (cmp2Op != GT_GE) || !var1Node->TypeIs(TYP_INT) || !var2Node->TypeIs(TYP_INT) ||
+            var2Node->gtOverflow() || cns1Node->IsIconHandle() || cns2Node->IsIconHandle() || (a < 0) ||
+            (a > INT_MAX) || (b < 0) || (b > INT_MAX))
+        {
+            return false;
+        }
+
+        // Morph can represent X - A as X + (-A).
+        GenTree* value  = var2Node->gtGetOp1();
+        GenTree* offset = var2Node->gtGetOp2();
+        if (!value->OperIs(GT_LCL_VAR) || !GenTree::Compare(var1Node->gtEffectiveVal(), value) ||
+            !offset->IsIntegralConst(var2Node->OperIs(GT_SUB) ? a : -a) || offset->IsIconHandle())
+        {
+            return false;
+        }
+
+        // An unsigned first check does not prove X is nonnegative as a signed int.
+        if (cmp1->IsUnsigned() && !cmp2->IsUnsigned())
+        {
+            return false;
+        }
+
+        // The sum fits uint32; a signed first check also requires it to fit int32.
+        uint64_t bound = static_cast<uint64_t>(a) + b;
+        if (!cmp1->IsUnsigned() && (bound > INT_MAX))
+        {
+            return false;
+        }
+
+        cmp1->gtOp1 = var1Node;
+        cmp1->gtOp2 = comp->gtNewIconNode(static_cast<int32_t>(bound));
+        cmp1->SetOper(cmp2IsReversed ? GT_LT : GT_GE);
+        return true;
+    }
+
+    if (cmp1->IsUnsigned() != cmp2->IsUnsigned())
+    {
+        return FoldNeverNegativeRangeTest(comp, cmp1, cmp1IsReversed, cmp2, cmp2IsReversed);
+    }
 
     // Make sure variables are the same:
     if (!var2Node->OperIs(GT_LCL_VAR) || !GenTree::Compare(var1Node->gtEffectiveVal(), var2Node))
