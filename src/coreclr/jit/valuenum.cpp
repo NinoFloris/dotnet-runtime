@@ -12358,12 +12358,20 @@ void Compiler::fgValueNumberBlock(BasicBlock* blk)
         }
 #endif
 
+        fgVNUpdatedSideEffects = false;
         for (GenTree* const tree : stmt->TreeList())
         {
             // Set up ambient var referring to current tree.
             compCurTree = tree;
             fgValueNumberTree(tree);
             compCurTree = nullptr;
+        }
+
+        if (fgVNUpdatedSideEffects)
+        {
+            // Publish the non-faulting and ordering facts to the whole expression before
+            // later phases consider moving it or discarding its exception side effects.
+            gtUpdateStmtSideEffects(stmt);
         }
 
 #ifdef DEBUG
@@ -15895,6 +15903,17 @@ void Compiler::fgValueNumberAddExceptionSetForIndirection(GenTree* tree, GenTree
     }
 
     tree->gtVNPair = vnStore->VNPWithExc(tree->gtVNPair, excChkSet);
+
+    if ((excChkSet.GetConservative() == ValueNumStore::VNForEmptyExcSet()) && tree->OperIsIndirOrArrMetaData())
+    {
+        tree->gtFlags |= GTF_IND_NONFAULTING;
+        if (survivedL && (baseCVN == baseLVN))
+        {
+            // This proof is contextual: the load must remain after the check it relies on.
+            tree->SetHasOrderingSideEffect();
+        }
+        fgVNUpdatedSideEffects = true;
+    }
 }
 
 //--------------------------------------------------------------------------------

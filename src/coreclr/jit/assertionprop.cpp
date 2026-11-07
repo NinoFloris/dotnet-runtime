@@ -5357,7 +5357,7 @@ bool Compiler::optNonNullAssertionProp_Ind(ASSERT_VALARG_TP assertions, GenTree*
 {
     assert(indir->OperIsIndirOrArrMetaData());
 
-    if ((indir->gtFlags & GTF_EXCEPT) == 0)
+    if ((indir->gtFlags & (GTF_EXCEPT | GTF_IND_NONFAULTING)) != GTF_EXCEPT)
     {
         return false;
     }

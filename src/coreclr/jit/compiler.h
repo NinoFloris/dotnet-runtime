@@ -6703,6 +6703,7 @@ public:
     };
     typedef JitHashTable<ValueNum, JitSmallPrimitiveKeyFuncs<ValueNum>, SurvivedBlocks> SurvivedExceptionsMap;
     SurvivedExceptionsMap* vnSurvivedExceptions = nullptr;
+    bool fgVNUpdatedSideEffects = false;
     bool fgVNSurvivedException(ValueNum excItemVN);
     void fgVNDropSurvivedCastException(GenTreeCall* call);
 
