@@ -12032,6 +12032,7 @@ PhaseStatus Compiler::fgValueNumber()
     optComputeLoopSideEffects();
 
     vnSurvivedExceptions = new (getAllocator(CMK_ValueNumber)) SurvivedExceptionsMap(getAllocator(CMK_ValueNumber));
+    vnHasConservativeBranchFacts = false;
 
     // At the block level, we will use a modified worklist algorithm.  We will have two
     // "todo" sets of unvisited blocks.  Blocks (other than the entry block) are put in a
@@ -12406,6 +12407,7 @@ void Compiler::fgValueNumberBlock(BasicBlock* blk)
         }
     }
 
+    fgVNRecordNonNullBranch(blk);
     compCurBB = nullptr;
 }
 
@@ -15898,6 +15900,7 @@ void Compiler::fgValueNumberAddExceptionSetForIndirection(GenTree* tree, GenTree
     ValueNumPair excChkSet = vnStore->VNPForEmptyExcSet();
     ValueNum     itemL     = ValueNumStore::NoVN;
     bool         survivedL = false;
+    bool         survivedC = false;
     if (!vnStore->IsKnownNonNull(baseLVN))
     {
         itemL     = vnStore->VNForFunc(TYP_REF, VNF_NullPtrExc, baseLVN);
@@ -15909,10 +15912,11 @@ void Compiler::fgValueNumberAddExceptionSetForIndirection(GenTree* tree, GenTree
     }
     if (!vnStore->IsKnownNonNull(baseCVN))
     {
-        // A conservative base that differs from the liberal one is unique to this load and never
-        // recurs, so it is neither looked up nor recorded.
+        // Do not populate the survivor map with unique conservative loads. A branch
+        // can nevertheless establish a conservative fact reused through an SSA local.
         if ((baseCVN == baseLVN) && (itemL != ValueNumStore::NoVN))
         {
+            survivedC = survivedL;
             if (!survivedL)
             {
                 excChkSet.SetConservative(vnStore->VNExcSetSingleton(itemL));
@@ -15920,7 +15924,13 @@ void Compiler::fgValueNumberAddExceptionSetForIndirection(GenTree* tree, GenTree
         }
         else
         {
-            excChkSet.SetConservative(vnStore->VNExcSetSingleton(vnStore->VNForFunc(TYP_REF, VNF_NullPtrExc, baseCVN)));
+            ValueNum itemC = vnStore->VNForFunc(TYP_REF, VNF_NullPtrExc, baseCVN);
+            survivedC      = vnHasConservativeBranchFacts && (vnSurvivedExceptions->LookupPointer(itemC) != nullptr) &&
+                        fgVNSurvivedException(itemC);
+            if (!survivedC)
+            {
+                excChkSet.SetConservative(vnStore->VNExcSetSingleton(itemC));
+            }
         }
     }
 
@@ -15929,7 +15939,7 @@ void Compiler::fgValueNumberAddExceptionSetForIndirection(GenTree* tree, GenTree
     if ((excChkSet.GetConservative() == ValueNumStore::VNForEmptyExcSet()) && tree->OperIsIndirOrArrMetaData())
     {
         tree->gtFlags |= GTF_IND_NONFAULTING;
-        if (survivedL && (baseCVN == baseLVN))
+        if (survivedC)
         {
             // This proof is contextual: the load must remain after the check it relies on.
             tree->SetHasOrderingSideEffect();
@@ -15939,21 +15949,93 @@ void Compiler::fgValueNumberAddExceptionSetForIndirection(GenTree* tree, GenTree
 }
 
 //--------------------------------------------------------------------------------
-// fgVNSurvivedException: Whether this exception item is ruled out at the current point, and record
+// fgVNRecordNonNullBranch: Record a non-null fact established on a branch edge.
+//
+// Arguments:
+//    block - the block whose trees have just been value numbered
+//
+void Compiler::fgVNRecordNonNullBranch(BasicBlock* block)
+{
+    if (!block->KindIs(BBJ_COND) || (block->GetTrueTarget() == block->GetFalseTarget()))
+    {
+        return;
+    }
+
+    GenTree* cond = block->lastStmt()->GetRootNode()->gtGetOp1();
+    if (!cond->OperIs(GT_EQ, GT_NE))
+    {
+        return;
+    }
+
+    GenTree* value = cond->gtGetOp1();
+    GenTree* zero  = cond->gtGetOp2();
+    if (value->IsIntegralConst(0))
+    {
+        std::swap(value, zero);
+    }
+    if (!zero->IsIntegralConst(0) || !value->TypeIs(TYP_REF) || !value->gtVNPair.BothDefined())
+    {
+        return;
+    }
+
+    BasicBlock* successor = cond->OperIs(GT_NE) ? block->GetTrueTarget() : block->GetFalseTarget();
+    if ((successor == block) || (successor == fgFirstBB) || !m_dfsTree->Contains(successor))
+    {
+        return;
+    }
+
+    // A fact about one edge is a fact at the successor only if every entry takes
+    // that edge. Include exceptional entries, just as the join proof does.
+    FlowEdge* preds = BlockDominancePreds(successor);
+    if (preds == nullptr)
+    {
+        return;
+    }
+    for (FlowEdge* edge = preds; edge != nullptr; edge = edge->getNextPredEdge())
+    {
+        BasicBlock* pred = edge->getSourceBlock();
+        if (m_dfsTree->Contains(pred) && (pred != block))
+        {
+            return;
+        }
+    }
+
+    ValueNum valueVN = vnStore->VNNormalValue(value->GetVN(VNK_Liberal));
+    if (!vnStore->IsKnownNonNull(valueVN))
+    {
+        fgVNSurvivedException(vnStore->VNForFunc(TYP_REF, VNF_NullPtrExc, valueVN), successor);
+        JITDUMP("Non-null branch fact for " FMT_VN " at " FMT_BB "\n", valueVN, successor->bbNum);
+    }
+    ValueNum conservativeVN = vnStore->VNNormalValue(value->GetVN(VNK_Conservative));
+    if ((conservativeVN != valueVN) && !vnStore->IsKnownNonNull(conservativeVN))
+    {
+        fgVNSurvivedException(vnStore->VNForFunc(TYP_REF, VNF_NullPtrExc, conservativeVN), successor);
+        vnHasConservativeBranchFacts = true;
+        JITDUMP("Conservative non-null branch fact for " FMT_VN " at " FMT_BB "\n", conservativeVN, successor->bbNum);
+    }
+}
+
+//--------------------------------------------------------------------------------
+// fgVNSurvivedException: Whether this exception item is ruled out at the given point, and record
 //    that the current block survives it. A block one of the recorded blocks dominates adds nothing; a
 //    block dominating a recorded one takes its place; any other is a further way of reaching the item
 //    and is added. One hash lookup serves both.
 //
 // Arguments:
 //    excItemVN - the exception item
+//    block     - the point to query and record; defaults to the current block
 //
 // Return Value:
 //    True if a block that survived the item dominates the current one, or every predecessor is
 //    dominated by one, the join of a diamond.
 //
-bool Compiler::fgVNSurvivedException(ValueNum excItemVN)
+bool Compiler::fgVNSurvivedException(ValueNum excItemVN, BasicBlock* block)
 {
-    if ((vnSurvivedExceptions == nullptr) || (compCurBB == nullptr) || (m_domTree == nullptr))
+    if (block == nullptr)
+    {
+        block = compCurBB;
+    }
+    if ((vnSurvivedExceptions == nullptr) || (block == nullptr) || (m_domTree == nullptr))
     {
         return false;
     }
@@ -15961,7 +16043,7 @@ bool Compiler::fgVNSurvivedException(ValueNum excItemVN)
     SurvivedBlocks* const blocks = vnSurvivedExceptions->LookupPointerOrAdd(excItemVN, SurvivedBlocks());
     if (blocks->first == nullptr)
     {
-        blocks->first = compCurBB;
+        blocks->first = block;
         return false;
     }
 
@@ -15972,7 +16054,7 @@ bool Compiler::fgVNSurvivedException(ValueNum excItemVN)
 
     for (int i = 0; i < count; i++)
     {
-        if (m_domTree->Dominates(blockAt(i), compCurBB))
+        if (m_domTree->Dominates(blockAt(i), block))
         {
             return true;
         }
@@ -15981,7 +16063,7 @@ bool Compiler::fgVNSurvivedException(ValueNum excItemVN)
     // Not dominated by a survivor. A join reached only through survivors counts as one and is recorded
     // as a survivor itself. Any other block is a further way of reaching the item. The join is judged on
     // its dominance predecessors, so a handler counts every way the try can be left before completing.
-    FlowEdge* const domPreds    = BlockDominancePreds(compCurBB);
+    FlowEdge* const domPreds    = BlockDominancePreds(block);
     bool            joinCovered = domPreds != nullptr;
     for (FlowEdge* edge = domPreds; edge != nullptr; edge = edge->getNextPredEdge())
     {
@@ -16009,9 +16091,9 @@ bool Compiler::fgVNSurvivedException(ValueNum excItemVN)
 
     for (int i = 0; i < count; i++)
     {
-        if (m_domTree->Dominates(compCurBB, blockAt(i)))
+        if (m_domTree->Dominates(block, blockAt(i)))
         {
-            blockAt(i) = compCurBB;
+            blockAt(i) = block;
             return joinCovered;
         }
     }
@@ -16019,7 +16101,7 @@ bool Compiler::fgVNSurvivedException(ValueNum excItemVN)
     {
         blocks->more = new (getAllocator(CMK_ValueNumber)) ArrayStack<BasicBlock*>(getAllocator(CMK_ValueNumber), 2);
     }
-    blocks->more->Push(compCurBB);
+    blocks->more->Push(block);
     return joinCovered;
 }
 

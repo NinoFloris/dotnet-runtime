@@ -6704,7 +6704,9 @@ public:
     typedef JitHashTable<ValueNum, JitSmallPrimitiveKeyFuncs<ValueNum>, SurvivedBlocks> SurvivedExceptionsMap;
     SurvivedExceptionsMap* vnSurvivedExceptions = nullptr;
     bool fgVNUpdatedSideEffects = false;
-    bool fgVNSurvivedException(ValueNum excItemVN);
+    bool vnHasConservativeBranchFacts = false;
+    bool fgVNSurvivedException(ValueNum excItemVN, BasicBlock* block = nullptr);
+    void fgVNRecordNonNullBranch(BasicBlock* block);
     void fgVNDropSurvivedCastException(GenTreeCall* call);
 
     // Adds the exception sets for the current tree node which is performing a division or modulus operation
