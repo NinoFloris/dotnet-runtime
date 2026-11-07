@@ -12033,6 +12033,7 @@ PhaseStatus Compiler::fgValueNumber()
 
     vnSurvivedExceptions = new (getAllocator(CMK_ValueNumber)) SurvivedExceptionsMap(getAllocator(CMK_ValueNumber));
     vnHasConservativeBranchFacts = false;
+    vnWriteBarrierStores         = nullptr;
 
     // At the block level, we will use a modified worklist algorithm.  We will have two
     // "todo" sets of unvisited blocks.  Blocks (other than the entry block) are put in a
@@ -12125,6 +12126,23 @@ PhaseStatus Compiler::fgValueNumber()
     {
         BasicBlock* const block = postOrder[i - 1];
         fgValueNumberBlocks(block, visitedBlocks, &traits);
+    }
+
+    if (vnWriteBarrierStores != nullptr)
+    {
+        for (int i = 0; i < vnWriteBarrierStores->Height(); i++)
+        {
+            GenTree* store = vnWriteBarrierStores->BottomRef(i);
+            if (store->OperIs(GT_STOREIND))
+            {
+                fgValueNumberStoreIndWriteBarrier(store->AsStoreInd());
+            }
+            else
+            {
+                fgValueNumberStoreBlkWriteBarrier(store->AsBlk());
+            }
+        }
+        vnWriteBarrierStores = nullptr;
     }
 
 #ifdef DEBUG
@@ -13020,6 +13038,179 @@ void Compiler::fgValueNumberRegisterConstFieldSeq(GenTreeIntCon* tree)
 }
 
 //------------------------------------------------------------------------
+// GetWriteBarrierForm: Determinate the exact type of write barrier required for the
+//    given address.
+//
+// Arguments:
+//    vnStore - ValueNumStore object
+//    vn      - VN of the address
+//
+// Return Value:
+//    Exact type of write barrier required for the given address.
+//
+static GCInfo::WriteBarrierForm GetWriteBarrierForm(Compiler* comp, ValueNum vn)
+{
+    ValueNumStore*  vnStore = comp->vnStore;
+    const var_types type    = vnStore->TypeOfVN(vn);
+    if (type == TYP_REF)
+    {
+        return GCInfo::WriteBarrierForm::WBF_BarrierUnchecked;
+    }
+    if (type != TYP_BYREF)
+    {
+        return GCInfo::WriteBarrierForm::WBF_BarrierUnknown;
+    }
+
+    VNFuncApp funcApp;
+    if (vnStore->GetVNFunc(vnStore->VNNormalValue(vn), &funcApp))
+    {
+        if (funcApp.FuncIs(VNF_PtrToArrElem))
+        {
+            // Check whether the array is on the heap
+            ValueNum arrayVN = funcApp.GetArg(1);
+            return GetWriteBarrierForm(comp, arrayVN);
+        }
+        if (funcApp.FuncIs(VNF_PtrToLoc))
+        {
+            // Pointer to a local
+            return GCInfo::WriteBarrierForm::WBF_NoBarrier;
+        }
+        if ((funcApp.FuncIs(VNF_PtrToStatic)) && vnStore->IsVNHandle(funcApp.GetArg(0), GTF_ICON_STATIC_BOX_PTR))
+        {
+            // Boxed static - always on the heap
+            return GCInfo::WriteBarrierForm::WBF_BarrierUnchecked;
+        }
+        if (funcApp.FuncIs(VNF_ADD))
+        {
+            // Check arguments of the GT_ADD
+            // To make it conservative, we require one of the arguments to be a constant, e.g.:
+            //
+            //   addressOfLocal + cns    -> NoBarrier
+            //   cns + addressWithinHeap -> BarrierUnchecked
+            //
+            // Because "addressOfLocal + nativeIntVariable" could be in fact a pointer to the heap.
+            // if "nativeIntVariable == addressWithinHeap - addressOfLocal".
+            //
+            if (vnStore->IsVNConstantNonHandle(funcApp.GetArg(0)))
+            {
+                return GetWriteBarrierForm(comp, funcApp.GetArg(1));
+            }
+            if (vnStore->IsVNConstantNonHandle(funcApp.GetArg(1)))
+            {
+                return GetWriteBarrierForm(comp, funcApp.GetArg(0));
+            }
+        }
+    }
+    return GCInfo::WriteBarrierForm::WBF_BarrierUnknown;
+}
+
+//------------------------------------------------------------------------
+// fgValueNumberStoreIndWriteBarrier: This function assists gcIsWriteBarrierCandidate using conservative
+//    VNs. Record the result before CSE can "hide" addresses/values under locals, making it impossible for
+//    gcIsWriteBarrierCandidate to determine the exact type of write barrier required
+//    (it's too late for it to rely on VNs).
+//
+//    There are three cases we handle here:
+//     * Target is not on the heap - no write barrier is required
+//     * Target could be on the heap, but the value being stored doesn't require any write barrier
+//     * Target is definitely on the heap - checked (slower) write barrier is not required
+//
+// Arguments:
+//    indir      - The STOREIND node
+//
+// Notes:
+//    Records the barrier classification on the STOREIND node.
+//
+void Compiler::fgValueNumberStoreIndWriteBarrier(GenTreeStoreInd* indir)
+{
+    const GenTree* value = indir->AsIndir()->Data();
+    const GenTree* addr  = indir->AsIndir()->Addr();
+
+    if (!indir->TypeIs(TYP_REF) || !value->TypeIs(TYP_REF) || ((indir->gtFlags & GTF_IND_TGT_NOT_HEAP) != 0))
+    {
+        return;
+    }
+
+    GCInfo::WriteBarrierForm barrierType = GCInfo::WriteBarrierForm::WBF_BarrierUnknown;
+
+    // First, analyze the value being stored
+    auto vnVisitor = [this](ValueNum vn) -> ValueNumStore::VNVisit {
+        if ((vn == ValueNumStore::VNForNull()) || vnStore->IsVNObjHandle(vn))
+        {
+            // No write barrier is required for null or nongc object handles as values
+            return ValueNumStore::VNVisit::Continue;
+        }
+        return ValueNumStore::VNVisit::Abort;
+    };
+
+    if (vnStore->VNVisitReachingVNs(vnStore->VNConservativeNormalValue(value->gtVNPair), vnVisitor) ==
+        ValueNumStore::VNVisit::Continue)
+    {
+        barrierType = GCInfo::WriteBarrierForm::WBF_NoBarrier;
+    }
+    // Next, analyze the address if we haven't already determined the barrier type from the value
+    else if ((indir->gtFlags & GTF_IND_TGT_HEAP) == 0)
+    {
+        // NOTE: we might want to inspect indirs with GTF_IND_TGT_HEAP flag as well - what if we can prove
+        // that they actually need no barrier? But that comes with a TP regression.
+        barrierType = GetWriteBarrierForm(this, vnStore->VNConservativeNormalValue(addr->gtVNPair));
+    }
+
+    JITDUMP("Trying to determine the exact type of write barrier for STOREIND [%d06]: ", dspTreeID(indir));
+    if (barrierType == GCInfo::WriteBarrierForm::WBF_NoBarrier)
+    {
+        JITDUMP("is not needed at all.\n");
+        indir->gtFlags |= GTF_IND_TGT_NOT_HEAP;
+        return;
+    }
+    if (barrierType == GCInfo::WriteBarrierForm::WBF_BarrierUnchecked)
+    {
+        JITDUMP("unchecked is fine.\n");
+        indir->gtFlags |= GTF_IND_TGT_HEAP;
+        return;
+    }
+
+    JITDUMP("unknown (checked).\n");
+    return;
+}
+
+//------------------------------------------------------------------------
+// fgValueNumberStoreBlkWriteBarrier: The STORE_BLK counterpart of
+//    fgValueNumberStoreIndWriteBarrier. For block stores that contain GC
+//    pointers, attempt to prove via VN analysis that the destination
+//    address is not on the GC heap (or always on the heap).
+//
+// Arguments:
+//    store      - The STORE_BLK node
+//
+// Notes:
+//    Records the barrier classification on the STOREBLK node.
+//
+void Compiler::fgValueNumberStoreBlkWriteBarrier(GenTreeBlk* store)
+{
+    if (!store->GetLayout()->HasGCPtr() || ((store->gtFlags & (GTF_IND_TGT_NOT_HEAP | GTF_IND_TGT_HEAP)) != 0))
+    {
+        return;
+    }
+
+    GCInfo::WriteBarrierForm barrierType =
+        GetWriteBarrierForm(this, vnStore->VNConservativeNormalValue(store->Addr()->gtVNPair));
+    if (barrierType == GCInfo::WriteBarrierForm::WBF_NoBarrier)
+    {
+        JITDUMP("Add GTF_IND_TGT_NOT_HEAP to STORE_BLK [%06d]: ", dspTreeID(store));
+        store->gtFlags |= GTF_IND_TGT_NOT_HEAP;
+        return;
+    }
+    if (barrierType == GCInfo::WriteBarrierForm::WBF_BarrierUnchecked)
+    {
+        JITDUMP("Add GTF_IND_TGT_HEAP to STORE_BLK [%06d]: ", dspTreeID(store));
+        store->gtFlags |= GTF_IND_TGT_HEAP;
+        return;
+    }
+    return;
+}
+
+//------------------------------------------------------------------------
 // fgValueNumberStore: Does value numbering for a store.
 //
 // While this method does indeed give a VN to the store tree itself, its
@@ -13153,6 +13344,27 @@ void Compiler::fgValueNumberStore(GenTree* store)
         storeExcSet = vnStore->VNPUnionExcSet(store->AsIndir()->Addr()->gtVNPair, storeExcSet);
     }
     store->gtVNPair = vnStore->VNPWithExc(vnStore->VNPForVoid(), storeExcSet);
+
+    bool classifyBarrier = false;
+    if (store->OperIs(GT_STOREIND))
+    {
+        classifyBarrier =
+            store->TypeIs(TYP_REF) && value->TypeIs(TYP_REF) && ((store->gtFlags & GTF_IND_TGT_NOT_HEAP) == 0);
+    }
+    else if (store->OperIs(GT_STORE_BLK))
+    {
+        classifyBarrier = store->AsBlk()->GetLayout()->HasGCPtr() &&
+                          ((store->gtFlags & (GTF_IND_TGT_NOT_HEAP | GTF_IND_TGT_HEAP)) == 0);
+    }
+    if (classifyBarrier)
+    {
+        if (vnWriteBarrierStores == nullptr)
+        {
+            vnWriteBarrierStores =
+                new (getAllocator(CMK_ValueNumber)) ArrayStack<GenTree*>(getAllocator(CMK_ValueNumber));
+        }
+        vnWriteBarrierStores->Push(store);
+    }
 }
 
 //------------------------------------------------------------------------
