@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <RequiresProcessIsolation>true</RequiresProcessIsolation>
+    <DebugType>None</DebugType>
+    <Optimize>True</Optimize>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="$(MSBuildProjectName).cs" />
+    <!-- Leave the branch fact for VN instead of folding the value during local AP. -->
+    <CLRTestEnvironmentVariable Include="DOTNET_JitEnableCrossBlockLocalAssertionProp" Value="0" />
+  </ItemGroup>
+</Project>

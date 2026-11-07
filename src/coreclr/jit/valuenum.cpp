@@ -12031,8 +12031,9 @@ PhaseStatus Compiler::fgValueNumber()
     // Compute the side effects of loops.
     optComputeLoopSideEffects();
 
-    vnSurvivedExceptions = new (getAllocator(CMK_ValueNumber)) SurvivedExceptionsMap(getAllocator(CMK_ValueNumber));
+    vnSurvivedExceptions         = new (getAllocator(CMK_ValueNumber)) VNFactMap(getAllocator(CMK_ValueNumber));
     vnHasConservativeBranchFacts = false;
+    vnKnownNullValues            = nullptr;
     vnWriteBarrierStores         = nullptr;
 
     // At the block level, we will use a modified worklist algorithm.  We will have two
@@ -12151,6 +12152,7 @@ PhaseStatus Compiler::fgValueNumber()
 #endif // DEBUG
 
     vnSurvivedExceptions = nullptr;
+    vnKnownNullValues    = nullptr;
     fgVNPassesCompleted++;
     vnState = nullptr;
 
@@ -12425,7 +12427,7 @@ void Compiler::fgValueNumberBlock(BasicBlock* blk)
         }
     }
 
-    fgVNRecordNonNullBranch(blk);
+    fgVNRecordNullBranchFacts(blk);
     compCurBB = nullptr;
 }
 
@@ -13344,6 +13346,16 @@ void Compiler::fgValueNumberStore(GenTree* store)
         storeExcSet = vnStore->VNPUnionExcSet(store->AsIndir()->Addr()->gtVNPair, storeExcSet);
     }
     store->gtVNPair = vnStore->VNPWithExc(vnStore->VNPForVoid(), storeExcSet);
+
+    // A null value never requires a write barrier. Keep the store and its destination
+    // null check: this fact says nothing about whether the destination is valid.
+    if ((vnKnownNullValues != nullptr) && store->OperIs(GT_STOREIND) && store->TypeIs(TYP_REF) &&
+        value->TypeIs(TYP_REF) && ((store->gtFlags & GTF_IND_TGT_NOT_HEAP) == 0) &&
+        fgVNFactIsAvailable(vnKnownNullValues, valueVNPair.GetConservative(), compCurBB, false))
+    {
+        store->gtFlags |= GTF_IND_TGT_NOT_HEAP;
+        JITDUMP("Null-edge fact removes write barrier on [%06u]\n", dspTreeID(store));
+    }
 
     bool classifyBarrier = false;
     if (store->OperIs(GT_STOREIND))
@@ -16161,12 +16173,12 @@ void Compiler::fgValueNumberAddExceptionSetForIndirection(GenTree* tree, GenTree
 }
 
 //--------------------------------------------------------------------------------
-// fgVNRecordNonNullBranch: Record a non-null fact established on a branch edge.
+// fgVNRecordNullBranchFacts: Record null and non-null facts established on branch edges.
 //
 // Arguments:
 //    block - the block whose trees have just been value numbered
 //
-void Compiler::fgVNRecordNonNullBranch(BasicBlock* block)
+void Compiler::fgVNRecordNullBranchFacts(BasicBlock* block)
 {
     if (!block->KindIs(BBJ_COND) || (block->GetTrueTarget() == block->GetFalseTarget()))
     {
@@ -16190,40 +16202,63 @@ void Compiler::fgVNRecordNonNullBranch(BasicBlock* block)
         return;
     }
 
-    BasicBlock* successor = cond->OperIs(GT_NE) ? block->GetTrueTarget() : block->GetFalseTarget();
-    if ((successor == block) || (successor == fgFirstBB) || !m_dfsTree->Contains(successor))
-    {
-        return;
-    }
-
-    // A fact about one edge is a fact at the successor only if every entry takes
-    // that edge. Include exceptional entries, just as the join proof does.
-    FlowEdge* preds = BlockDominancePreds(successor);
-    if (preds == nullptr)
-    {
-        return;
-    }
-    for (FlowEdge* edge = preds; edge != nullptr; edge = edge->getNextPredEdge())
-    {
-        BasicBlock* pred = edge->getSourceBlock();
-        if (m_dfsTree->Contains(pred) && (pred != block))
+    auto edgeEstablishesFact = [this, block](BasicBlock* successor) {
+        if ((successor == block) || (successor == fgFirstBB) || !m_dfsTree->Contains(successor))
         {
-            return;
+            return false;
+        }
+
+        // A fact about one edge is a fact at the successor only if every entry takes
+        // that edge. Include exceptional entries, just as the join proof does.
+        FlowEdge* preds = BlockDominancePreds(successor);
+        if (preds == nullptr)
+        {
+            return false;
+        }
+        for (FlowEdge* edge = preds; edge != nullptr; edge = edge->getNextPredEdge())
+        {
+            BasicBlock* pred = edge->getSourceBlock();
+            if (m_dfsTree->Contains(pred) && (pred != block))
+            {
+                return false;
+            }
+        }
+
+        return true;
+    };
+
+    BasicBlock* successor = cond->OperIs(GT_NE) ? block->GetTrueTarget() : block->GetFalseTarget();
+    if (edgeEstablishesFact(successor))
+    {
+        ValueNum valueVN = vnStore->VNNormalValue(value->GetVN(VNK_Liberal));
+        if (!vnStore->IsKnownNonNull(valueVN))
+        {
+            fgVNSurvivedException(vnStore->VNForFunc(TYP_REF, VNF_NullPtrExc, valueVN), successor);
+            JITDUMP("Non-null branch fact for " FMT_VN " at " FMT_BB "\n", valueVN, successor->bbNum);
+        }
+        ValueNum conservativeVN = vnStore->VNNormalValue(value->GetVN(VNK_Conservative));
+        if ((conservativeVN != valueVN) && !vnStore->IsKnownNonNull(conservativeVN))
+        {
+            fgVNSurvivedException(vnStore->VNForFunc(TYP_REF, VNF_NullPtrExc, conservativeVN), successor);
+            vnHasConservativeBranchFacts = true;
+            JITDUMP("Conservative non-null branch fact for " FMT_VN " at " FMT_BB "\n", conservativeVN,
+                    successor->bbNum);
         }
     }
 
-    ValueNum valueVN = vnStore->VNNormalValue(value->GetVN(VNK_Liberal));
-    if (!vnStore->IsKnownNonNull(valueVN))
+    successor = cond->OperIs(GT_EQ) ? block->GetTrueTarget() : block->GetFalseTarget();
+    if (edgeEstablishesFact(successor))
     {
-        fgVNSurvivedException(vnStore->VNForFunc(TYP_REF, VNF_NullPtrExc, valueVN), successor);
-        JITDUMP("Non-null branch fact for " FMT_VN " at " FMT_BB "\n", valueVN, successor->bbNum);
-    }
-    ValueNum conservativeVN = vnStore->VNNormalValue(value->GetVN(VNK_Conservative));
-    if ((conservativeVN != valueVN) && !vnStore->IsKnownNonNull(conservativeVN))
-    {
-        fgVNSurvivedException(vnStore->VNForFunc(TYP_REF, VNF_NullPtrExc, conservativeVN), successor);
-        vnHasConservativeBranchFacts = true;
-        JITDUMP("Conservative non-null branch fact for " FMT_VN " at " FMT_BB "\n", conservativeVN, successor->bbNum);
+        ValueNum valueVN = vnStore->VNConservativeNormalValue(value->gtVNPair);
+        if (valueVN != ValueNumStore::VNForNull())
+        {
+            if (vnKnownNullValues == nullptr)
+            {
+                vnKnownNullValues = new (getAllocator(CMK_ValueNumber)) VNFactMap(getAllocator(CMK_ValueNumber));
+            }
+            fgVNFactIsAvailable(vnKnownNullValues, valueVN, successor, true);
+            JITDUMP("Null branch fact for " FMT_VN " at " FMT_BB "\n", valueVN, successor->bbNum);
+        }
     }
 }
 
@@ -16243,19 +16278,30 @@ void Compiler::fgVNRecordNonNullBranch(BasicBlock* block)
 //
 bool Compiler::fgVNSurvivedException(ValueNum excItemVN, BasicBlock* block)
 {
-    if (block == nullptr)
-    {
-        block = compCurBB;
-    }
-    if ((vnSurvivedExceptions == nullptr) || (block == nullptr) || (m_domTree == nullptr))
+    return fgVNFactIsAvailable(vnSurvivedExceptions, excItemVN, block != nullptr ? block : compCurBB, true);
+}
+
+// Check a fact's dominance and join coverage. With record=true the caller establishes
+// the fact on normal completion. Queries do not establish facts or mutate the map.
+bool Compiler::fgVNFactIsAvailable(VNFactMap* facts, ValueNum factVN, BasicBlock* block, bool record)
+{
+    if ((facts == nullptr) || (block == nullptr) || (m_domTree == nullptr))
     {
         return false;
     }
 
-    SurvivedBlocks* const blocks = vnSurvivedExceptions->LookupPointerOrAdd(excItemVN, SurvivedBlocks());
+    VNFactBlocks* const blocks =
+        record ? facts->LookupPointerOrAdd(factVN, VNFactBlocks()) : facts->LookupPointer(factVN);
+    if (blocks == nullptr)
+    {
+        return false;
+    }
     if (blocks->first == nullptr)
     {
-        blocks->first = block;
+        if (record)
+        {
+            blocks->first = block;
+        }
         return false;
     }
 
@@ -16299,6 +16345,11 @@ bool Compiler::fgVNSurvivedException(ValueNum excItemVN, BasicBlock* block)
             joinCovered = false;
             break;
         }
+    }
+
+    if (!record)
+    {
+        return joinCovered;
     }
 
     for (int i = 0; i < count; i++)

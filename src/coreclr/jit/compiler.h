@@ -6697,21 +6697,22 @@ public:
     // The value numbers a null check of an address is keyed on, constant offsets peeled
     void fgVNNullCheckBases(GenTree* baseAddr, ValueNum* baseLVN, ValueNum* baseCVN);
 
-    // During value numbering, for each exception item the blocks that survived it, none dominating
-    // another. Reaching a point one of them dominates means the item was not raised there, so it cannot
-    // be raised here either: the same null check, division or cast has been survived.
-    // The first surviving block is held inline, most items never see a second one.
-    struct SurvivedBlocks
+    // Blocks establishing a value-number fact, none dominating another.
+    // Keep the first block inline; most facts need only one.
+    struct VNFactBlocks
     {
         BasicBlock*              first = nullptr;
         ArrayStack<BasicBlock*>* more  = nullptr;
     };
-    typedef JitHashTable<ValueNum, JitSmallPrimitiveKeyFuncs<ValueNum>, SurvivedBlocks> SurvivedExceptionsMap;
-    SurvivedExceptionsMap* vnSurvivedExceptions = nullptr;
+    typedef JitHashTable<ValueNum, JitSmallPrimitiveKeyFuncs<ValueNum>, VNFactBlocks> VNFactMap;
+    // Exception items survived on normal completion, and conservative VNs proven null by branch edges.
+    VNFactMap* vnSurvivedExceptions = nullptr;
+    VNFactMap* vnKnownNullValues = nullptr;
     bool fgVNUpdatedSideEffects = false;
     bool vnHasConservativeBranchFacts = false;
     bool fgVNSurvivedException(ValueNum excItemVN, BasicBlock* block = nullptr);
-    void fgVNRecordNonNullBranch(BasicBlock* block);
+    bool fgVNFactIsAvailable(VNFactMap* facts, ValueNum factVN, BasicBlock* block, bool record);
+    void fgVNRecordNullBranchFacts(BasicBlock* block);
     void fgVNDropSurvivedCastException(GenTreeCall* call);
 
     // Adds the exception sets for the current tree node which is performing a division or modulus operation
