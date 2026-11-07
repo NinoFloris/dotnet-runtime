@@ -6714,7 +6714,8 @@ public:
     ValueNumPair fgValueNumberDivisionExceptions(genTreeOps oper,
                                                  GenTree*   dividend,
                                                  GenTree*   divisor,
-                                                 var_types  simdBaseType = TYP_UNDEF);
+                                                 var_types  simdBaseType = TYP_UNDEF,
+                                                 GenTreeFlags* nonThrowingFlags = nullptr);
 
     // Adds the exception set for the current tree node which is performing a overflow checking operation
     void fgValueNumberAddExceptionSetForOverflow(GenTree* tree);
@@ -9359,7 +9360,7 @@ protected:
 
 public:
     RangeCheck*  GetRangeCheck(int customBudget = 0);
-    void         optVnNonNullPropCurStmt(BasicBlock* block, Statement* stmt, GenTree* tree);
+    void         optVnWriteBarrierPropCurStmt(Statement* stmt, GenTreeStoreInd* store);
     fgWalkResult optVNBasedFoldCurStmt(BasicBlock* block, Statement* stmt, GenTree* parent, GenTree* tree);
     GenTree*     optVNConstantPropOnJTrue(BasicBlock* block, GenTree* test);
     GenTree*     optVNBasedFoldConstExpr(BasicBlock* block, GenTree* parent, GenTree* tree);

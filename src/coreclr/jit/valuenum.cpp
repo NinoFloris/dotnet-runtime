@@ -14571,6 +14571,12 @@ void Compiler::fgValueNumberCastTree(GenTree* tree)
     assert(genActualType(castToType) == genActualType(tree->TypeGet())); // Ensure that the resultType is correct
 
     tree->gtVNPair = vnStore->VNPairForCast(srcVNPair, castToType, castFromType, srcIsUnsigned, hasOverflowCheck);
+    if (hasOverflowCheck && vnStore->IsVNConstant(vnStore->VNConservativeNormalValue(tree->gtVNPair)))
+    {
+        // VN only folds checked casts when they cannot overflow.
+        tree->ClearOverflow();
+        fgVNUpdatedSideEffects = true;
+    }
 }
 
 // Compute the ValueNumber for a cast operation
@@ -15141,6 +15147,22 @@ bool Compiler::fgValueNumberSpecialIntrinsic(GenTreeCall* call)
 
 void Compiler::fgValueNumberCall(GenTreeCall* call)
 {
+    if (call->NeedsNullCheck() && !call->IsHelperCall())
+    {
+        ValueNum baseLVN;
+        ValueNum baseCVN;
+        fgVNNullCheckBases(call->gtArgs.GetThisArg()->GetNode(), &baseLVN, &baseCVN);
+        bool survivedL = vnStore->IsKnownNonNull(baseLVN) ||
+                         fgVNSurvivedException(vnStore->VNForFunc(TYP_REF, VNF_NullPtrExc, baseLVN));
+        if (((baseCVN == baseLVN) && survivedL) || vnStore->IsKnownNonNull(baseCVN))
+        {
+            // The ordinary call remains a side effect and can still throw in its body.
+            // Only its explicit receiver null check is redundant.
+            call->gtFlags &= ~GTF_CALL_NULLCHECK;
+            fgVNUpdatedSideEffects = true;
+        }
+    }
+
     if (call->IsHelperCall())
     {
         bool modHeap = fgValueNumberHelperCall(call);
@@ -16138,7 +16160,9 @@ void Compiler::fgVNNullCheckBases(GenTree* baseAddr, ValueNum* baseLVN, ValueNum
 //
 void Compiler::fgValueNumberAddExceptionSetForDivision(GenTree* tree)
 {
-    ValueNumPair exceptions = fgValueNumberDivisionExceptions(tree->OperGet(), tree->gtGetOp1(), tree->gtGetOp2());
+    GenTreeFlags nonThrowingFlags = GTF_EMPTY;
+    ValueNumPair exceptions       = fgValueNumberDivisionExceptions(tree->OperGet(), tree->gtGetOp1(), tree->gtGetOp2(),
+                                                                    TYP_UNDEF, &nonThrowingFlags);
     // Unpack, Norm,Exc for the tree's VN
     ValueNumPair vnpTreeNorm;
     ValueNumPair vnpTreeExc;
@@ -16146,6 +16170,13 @@ void Compiler::fgValueNumberAddExceptionSetForDivision(GenTree* tree)
 
     ValueNumPair newExcSet = vnStore->VNPExcSetUnion(vnpTreeExc, exceptions);
     tree->gtVNPair         = vnStore->VNPWithExc(vnpTreeNorm, newExcSet);
+
+    if ((nonThrowingFlags & ~tree->gtFlags) != GTF_EMPTY)
+    {
+        tree->gtFlags |= nonThrowingFlags;
+        fgVNUpdatedSideEffects = true;
+        JITDUMP("Published division exception proofs on [%06u]\n", dspTreeID(tree));
+    }
 }
 
 //--------------------------------------------------------------------------------
@@ -16157,14 +16188,13 @@ void Compiler::fgValueNumberAddExceptionSetForDivision(GenTree* tree)
 //    dividend     - Tree representing dividend
 //    divisor      - Tree representing divisor
 //    simdBaseType - SIMD base type, or TYP_UNDEF for scalar division
+//    nonThrowingFlags - optional scalar IR flags for conservative proofs, including ordering constraints
 //
 // Return Value:
 //    VNP representing exception set
 //
-ValueNumPair Compiler::fgValueNumberDivisionExceptions(genTreeOps oper,
-                                                       GenTree*   dividend,
-                                                       GenTree*   divisor,
-                                                       var_types  simdBaseType)
+ValueNumPair Compiler::fgValueNumberDivisionExceptions(
+    genTreeOps oper, GenTree* dividend, GenTree* divisor, var_types simdBaseType, GenTreeFlags* nonThrowingFlags)
 {
     // A Divide By Zero exception may be possible.
     //
@@ -16386,6 +16416,32 @@ ValueNumPair Compiler::fgValueNumberDivisionExceptions(genTreeOps oper,
         }
     }
 
+    if (nonThrowingFlags != nullptr)
+    {
+        assert(!isSimdOper);
+        *nonThrowingFlags = GTF_EMPTY;
+        if (vnpDivZeroExc.GetConservative() == ValueNumStore::VNForEmptyExcSet())
+        {
+            *nonThrowingFlags |= GTF_DIV_MOD_NO_BY_ZERO;
+            if (needDivideByZeroExcCon)
+            {
+                *nonThrowingFlags |= GTF_ORDER_SIDEEFF;
+            }
+        }
+
+        // The arithmetic exception item uses the liberal dividend. Require the same
+        // conservative dividend before publishing a contextual proof on the operation.
+        if (!isUnsignedOper && (vnpArithmExc.GetConservative() == ValueNumStore::VNForEmptyExcSet()) &&
+            (!needArithmeticExcCon || vnpDividendNorm.BothEqual()))
+        {
+            *nonThrowingFlags |= GTF_DIV_MOD_NO_OVERFLOW;
+            if (needArithmeticExcCon)
+            {
+                *nonThrowingFlags |= GTF_ORDER_SIDEEFF;
+            }
+        }
+    }
+
     return vnStore->VNPExcSetUnion(vnpDivZeroExc, vnpArithmExc);
 }
 
@@ -16425,6 +16481,12 @@ void Compiler::fgValueNumberAddExceptionSetForOverflow(GenTree* tree)
         // We only fold to constant VNs for operations that provably cannot overflow.
         if (vnStore->IsVNConstant(vnNorm))
         {
+            if (vnKind == VNK_Conservative)
+            {
+                tree->ClearOverflow();
+                fgVNUpdatedSideEffects = true;
+                JITDUMP("Published constant overflow proof on [%06u]\n", dspTreeID(tree));
+            }
             continue;
         }
 
@@ -16434,6 +16496,12 @@ void Compiler::fgValueNumberAddExceptionSetForOverflow(GenTree* tree)
         if ((vnNorm == vnStore->VNNormalValue(tree->gtGetOp1()->GetVN(vnKind))) ||
             (vnNorm == vnStore->VNNormalValue(tree->gtGetOp2()->GetVN(vnKind))))
         {
+            if (vnKind == VNK_Conservative)
+            {
+                tree->ClearOverflow();
+                fgVNUpdatedSideEffects = true;
+                JITDUMP("Published identity overflow proof on [%06u]\n", dspTreeID(tree));
+            }
             // TODO-Review: would it be acceptable to make ValueNumStore::EvalUsingMathIdentity
             // public just to assert here?
             continue;
