@@ -6643,8 +6643,7 @@ public:
     void fgValueNumberTree(GenTree* tree);
 
     void fgValueNumberStore(GenTree* tree);
-    void fgValueNumberStoreIndWriteBarrier(GenTreeStoreInd* store);
-    void fgValueNumberStoreBlkWriteBarrier(GenTreeBlk* store);
+    void fgValueNumberWriteBarrier(GenTree* store);
 
     // Stores awaiting classification once all reaching VNs, including backedges, are available.
     ArrayStack<GenTree*>* vnWriteBarrierStores = nullptr;
@@ -6710,8 +6709,45 @@ public:
     VNFactMap* vnKnownNullValues = nullptr;
     bool fgVNUpdatedSideEffects = false;
     bool vnHasConservativeBranchFacts = false;
-    bool fgVNSurvivedException(ValueNum excItemVN, BasicBlock* block = nullptr);
-    bool fgVNFactIsAvailable(VNFactMap* facts, ValueNum factVN, BasicBlock* block, bool record);
+    BasicBlock* fgVNSurvivedException(ValueNum excItemVN, BasicBlock* block = nullptr);
+    BasicBlock* fgVNGetFactAnchor(VNFactMap* facts, ValueNum factVN, BasicBlock* block, bool record);
+
+    // Provenance of ordering effects introduced by contextual exception proofs. A block
+    // dependency requires execution through the establishing block; an inherited dependency
+    // has no requirement beyond its operands. Absence of a record means the dependency is unknown.
+    // This metadata describes facts, not whether a particular transformation may move a node.
+    // The phase driver invalidates it before later tree or flow changes; exact clones must copy it.
+    class VNExceptionDependency
+    {
+        BasicBlock* m_establishingBlock;
+
+    public:
+        VNExceptionDependency() : m_establishingBlock(nullptr) {}
+        explicit VNExceptionDependency(BasicBlock* block) : m_establishingBlock(block)
+        {
+            assert(block != nullptr);
+        }
+        bool IsInherited() const { return m_establishingBlock == nullptr; }
+        BasicBlock* GetEstablishingBlock() const
+        {
+            assert(!IsInherited());
+            return m_establishingBlock;
+        }
+    };
+
+private:
+    typedef JitHashTable<GenTree*, JitPtrKeyFuncs<GenTree>, VNExceptionDependency> VNExceptionDependencyMap;
+    VNExceptionDependencyMap* vnExceptionDependencies = nullptr;
+
+public:
+    void fgVNRecordExceptionDependency(GenTree* node, BasicBlock* establishingBlock);
+    void fgVNUpdateSideEffects(Statement* stmt);
+    void fgVNCopyExceptionDependencies(GenTree* source, GenTree* clone);
+    bool fgVNTryGetExceptionDependency(GenTree* node, VNExceptionDependency* dependency) const
+    {
+        return (vnExceptionDependencies != nullptr) && vnExceptionDependencies->Lookup(node, dependency);
+    }
+    void fgVNClearExceptionDependencies() { vnExceptionDependencies = nullptr; }
     void fgVNRecordNullBranchFacts(BasicBlock* block);
     void fgVNDropSurvivedCastException(GenTreeCall* call);
 
@@ -6723,7 +6759,8 @@ public:
                                                  GenTree*   dividend,
                                                  GenTree*   divisor,
                                                  var_types  simdBaseType = TYP_UNDEF,
-                                                 GenTreeFlags* nonThrowingFlags = nullptr);
+                                                 GenTreeFlags* nonThrowingFlags = nullptr,
+                                                 BasicBlock**  orderAnchor      = nullptr);
 
     // Adds the exception set for the current tree node which is performing a overflow checking operation
     void fgValueNumberAddExceptionSetForOverflow(GenTree* tree);

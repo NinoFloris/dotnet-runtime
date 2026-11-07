@@ -3566,6 +3566,9 @@ void Compiler::optPerformHoistExpr(GenTree* origExpr, BasicBlock* exprBb, FlowGr
     // Copy any loop memory dependence.
     optCopyLoopMemoryDependence(origExpr, hoistExpr);
 
+    // Preserve provenance because this clone may be considered for further motion.
+    fgVNCopyExceptionDependencies(origExpr, hoistExpr);
+
     // At this point we should have a cloned expression
     hoistExpr->gtFlags |= GTF_MAKE_CSE;
     assert(hoistExpr != origExpr);
@@ -4308,6 +4311,7 @@ void Compiler::optHoistLoopBlocks(FlowGraphNaturalLoop* loop,
             bool m_hoistable;
             bool m_cctorDependent;
             bool m_invariant;
+            bool m_orderingSatisfied;
 
 #ifdef DEBUG
             const char* m_failReason;
@@ -4318,6 +4322,7 @@ void Compiler::optHoistLoopBlocks(FlowGraphNaturalLoop* loop,
                 , m_hoistable(false)
                 , m_cctorDependent(false)
                 , m_invariant(false)
+                , m_orderingSatisfied(true)
             {
 #ifdef DEBUG
                 m_failReason = "unset";
@@ -4338,7 +4343,48 @@ void Compiler::optHoistLoopBlocks(FlowGraphNaturalLoop* loop,
         BitVecTraits*         m_traits;
         BitVec                m_defExec;
 
-        bool IsNodeHoistable(GenTree* node)
+        //------------------------------------------------------------------------
+        // IsOrderingSatisfiedAtPreheader: Whether every ordering side effect in a tree comes from a
+        //   non-throwing proof that also holds in the preheader.
+        //
+        // Arguments:
+        //    node                      - the tree's root
+        //    childrenOrderingSatisfied - whether this holds for each operand
+        //
+        // Notes:
+        //    Value numbering records, for each node it pinned with a contextual proof, the block
+        //    that justified it, and the nodes that only inherited such a pin from an operand.
+        //    Moving the node into the preheader keeps the proof valid when that block dominates
+        //    the preheader. Any other ordering side effect has an unknown dependence (a volatile
+        //    access, a removed bounds check) and pins the tree.
+        //
+        bool IsOrderingSatisfiedAtPreheader(GenTree* node, bool childrenOrderingSatisfied)
+        {
+            if ((node->gtFlags & GTF_ORDER_SIDEEFF) == 0)
+            {
+                return true;
+            }
+
+            if (!childrenOrderingSatisfied)
+            {
+                return false;
+            }
+
+            VNExceptionDependency dependency;
+            if ((m_compiler->m_domTree != nullptr) && m_compiler->fgVNTryGetExceptionDependency(node, &dependency))
+            {
+                BasicBlock* const preheader = m_loop->EntryEdge(0)->getSourceBlock();
+                // Hoisting appends to the canonical preheader, after its existing statements.
+                // Thus a proof established in the preheader itself also precedes the new copy.
+                assert(preheader->KindIs(BBJ_ALWAYS));
+                return dependency.IsInherited() ||
+                       m_compiler->m_domTree->Dominates(dependency.GetEstablishingBlock(), preheader);
+            }
+
+            return !node->OperSupportsOrderingSideEffect();
+        }
+
+        bool IsNodeHoistable(GenTree* node, bool orderingSatisfied)
         {
             // TODO-CQ: This is a more restrictive version of a check that optIsCSEcandidate already does - it allows
             // a struct typed node if a class handle can be recovered from it.
@@ -4355,13 +4401,15 @@ void Compiler::optHoistLoopBlocks(FlowGraphNaturalLoop* loop,
                 // hence this check is not present in optIsCSEcandidate().
                 return true;
             }
-            else if ((node->gtFlags & GTF_ORDER_SIDEEFF) != 0)
+            else if (((node->gtFlags & GTF_ORDER_SIDEEFF) != 0) && !orderingSatisfied)
             {
-                // If a node has an order side effect, we can't hoist it at all: we don't know what the order
-                // dependence actually is. For example, assertion prop might have determined a node can't throw
-                // an exception, and eliminated the GTF_EXCEPT flag, replacing it with GTF_ORDER_SIDEEFF. We
-                // can't hoist because we might then hoist above the expression that led assertion prop to make
-                // that decision. This can happen in JitOptRepeat, where hoisting can follow assertion prop.
+                // If a node has an order side effect, we can't hoist it at all unless every one of them is a
+                // non-throwing proof that holds in the preheader (see IsOrderingSatisfiedAtPreheader). Otherwise we
+                // don't know what the order dependence actually is. For example, assertion prop might have determined a
+                // node can't throw an exception, and eliminated the GTF_EXCEPT flag, replacing it with
+                // GTF_ORDER_SIDEEFF. We can't hoist because we might then hoist above the expression that led assertion
+                // prop to make that decision. This can happen in JitOptRepeat, where hoisting can follow assertion
+                // prop.
                 return false;
             }
 
@@ -4566,7 +4614,8 @@ void Compiler::optHoistLoopBlocks(FlowGraphNaturalLoop* loop,
                     // In general it doesn't make sense to hoist a local node but there are exceptions, for example
                     // LCL_FLD nodes (because then the variable cannot be enregistered and the node always turns
                     // into a memory access).
-                    top.m_hoistable = IsNodeHoistable(tree);
+                    top.m_orderingSatisfied = IsOrderingSatisfiedAtPreheader(tree, true);
+                    top.m_hoistable         = IsNodeHoistable(tree, top.m_orderingSatisfied);
                 }
 
 #ifdef DEBUG
@@ -4587,9 +4636,10 @@ void Compiler::optHoistLoopBlocks(FlowGraphNaturalLoop* loop,
                 return fgWalkResult::WALK_CONTINUE;
             }
 
-            bool treeIsCctorDependent     = tree->OperIsIndir() && ((tree->gtFlags & GTF_IND_INITCLASS) != 0);
-            bool treeIsInvariant          = true;
-            bool treeHasHoistableChildren = false;
+            bool treeIsCctorDependent      = tree->OperIsIndir() && ((tree->gtFlags & GTF_IND_INITCLASS) != 0);
+            bool treeIsInvariant           = true;
+            bool treeHasHoistableChildren  = false;
+            bool childrenOrderingSatisfied = true;
             int  childCount;
 
 #ifdef DEBUG
@@ -4599,6 +4649,8 @@ void Compiler::optHoistLoopBlocks(FlowGraphNaturalLoop* loop,
             for (childCount = 0; m_valueStack.TopRef(childCount).Node() != tree; childCount++)
             {
                 Value& child = m_valueStack.TopRef(childCount);
+
+                childrenOrderingSatisfied &= child.m_orderingSatisfied;
 
                 if (child.m_hoistable)
                 {
@@ -4655,7 +4707,8 @@ void Compiler::optHoistLoopBlocks(FlowGraphNaturalLoop* loop,
             {
                 if (treeIsHoistable)
                 {
-                    treeIsHoistable = IsNodeHoistable(tree);
+                    treeIsHoistable =
+                        IsNodeHoistable(tree, IsOrderingSatisfiedAtPreheader(tree, childrenOrderingSatisfied));
                     if (!treeIsHoistable)
                     {
                         INDEBUG(failReason = "not handled by hoisting or CSE";)
@@ -4886,9 +4939,10 @@ void Compiler::optHoistLoopBlocks(FlowGraphNaturalLoop* loop,
 
             Value& top = m_valueStack.TopRef();
             assert(top.Node() == tree);
-            top.m_hoistable      = treeIsHoistable;
-            top.m_cctorDependent = treeIsCctorDependent;
-            top.m_invariant      = treeIsInvariant;
+            top.m_hoistable         = treeIsHoistable;
+            top.m_cctorDependent    = treeIsCctorDependent;
+            top.m_orderingSatisfied = IsOrderingSatisfiedAtPreheader(tree, childrenOrderingSatisfied);
+            top.m_invariant         = treeIsInvariant;
 
 #ifdef DEBUG
             if (!top.m_invariant || !top.m_hoistable)

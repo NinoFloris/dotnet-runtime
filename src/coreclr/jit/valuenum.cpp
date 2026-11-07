@@ -12032,6 +12032,7 @@ PhaseStatus Compiler::fgValueNumber()
     optComputeLoopSideEffects();
 
     vnSurvivedExceptions         = new (getAllocator(CMK_ValueNumber)) VNFactMap(getAllocator(CMK_ValueNumber));
+    vnExceptionDependencies      = nullptr;
     vnHasConservativeBranchFacts = false;
     vnKnownNullValues            = nullptr;
     vnWriteBarrierStores         = nullptr;
@@ -12133,15 +12134,7 @@ PhaseStatus Compiler::fgValueNumber()
     {
         for (int i = 0; i < vnWriteBarrierStores->Height(); i++)
         {
-            GenTree* store = vnWriteBarrierStores->BottomRef(i);
-            if (store->OperIs(GT_STOREIND))
-            {
-                fgValueNumberStoreIndWriteBarrier(store->AsStoreInd());
-            }
-            else
-            {
-                fgValueNumberStoreBlkWriteBarrier(store->AsBlk());
-            }
+            fgValueNumberWriteBarrier(vnWriteBarrierStores->BottomRef(i));
         }
         vnWriteBarrierStores = nullptr;
     }
@@ -12390,9 +12383,7 @@ void Compiler::fgValueNumberBlock(BasicBlock* blk)
 
         if (fgVNUpdatedSideEffects)
         {
-            // Publish the non-faulting and ordering facts to the whole expression before
-            // later phases consider moving it or discarding its exception side effects.
-            gtUpdateStmtSideEffects(stmt);
+            fgVNUpdateSideEffects(stmt);
         }
 
 #ifdef DEBUG
@@ -13040,179 +13031,6 @@ void Compiler::fgValueNumberRegisterConstFieldSeq(GenTreeIntCon* tree)
 }
 
 //------------------------------------------------------------------------
-// GetWriteBarrierForm: Determinate the exact type of write barrier required for the
-//    given address.
-//
-// Arguments:
-//    vnStore - ValueNumStore object
-//    vn      - VN of the address
-//
-// Return Value:
-//    Exact type of write barrier required for the given address.
-//
-static GCInfo::WriteBarrierForm GetWriteBarrierForm(Compiler* comp, ValueNum vn)
-{
-    ValueNumStore*  vnStore = comp->vnStore;
-    const var_types type    = vnStore->TypeOfVN(vn);
-    if (type == TYP_REF)
-    {
-        return GCInfo::WriteBarrierForm::WBF_BarrierUnchecked;
-    }
-    if (type != TYP_BYREF)
-    {
-        return GCInfo::WriteBarrierForm::WBF_BarrierUnknown;
-    }
-
-    VNFuncApp funcApp;
-    if (vnStore->GetVNFunc(vnStore->VNNormalValue(vn), &funcApp))
-    {
-        if (funcApp.FuncIs(VNF_PtrToArrElem))
-        {
-            // Check whether the array is on the heap
-            ValueNum arrayVN = funcApp.GetArg(1);
-            return GetWriteBarrierForm(comp, arrayVN);
-        }
-        if (funcApp.FuncIs(VNF_PtrToLoc))
-        {
-            // Pointer to a local
-            return GCInfo::WriteBarrierForm::WBF_NoBarrier;
-        }
-        if ((funcApp.FuncIs(VNF_PtrToStatic)) && vnStore->IsVNHandle(funcApp.GetArg(0), GTF_ICON_STATIC_BOX_PTR))
-        {
-            // Boxed static - always on the heap
-            return GCInfo::WriteBarrierForm::WBF_BarrierUnchecked;
-        }
-        if (funcApp.FuncIs(VNF_ADD))
-        {
-            // Check arguments of the GT_ADD
-            // To make it conservative, we require one of the arguments to be a constant, e.g.:
-            //
-            //   addressOfLocal + cns    -> NoBarrier
-            //   cns + addressWithinHeap -> BarrierUnchecked
-            //
-            // Because "addressOfLocal + nativeIntVariable" could be in fact a pointer to the heap.
-            // if "nativeIntVariable == addressWithinHeap - addressOfLocal".
-            //
-            if (vnStore->IsVNConstantNonHandle(funcApp.GetArg(0)))
-            {
-                return GetWriteBarrierForm(comp, funcApp.GetArg(1));
-            }
-            if (vnStore->IsVNConstantNonHandle(funcApp.GetArg(1)))
-            {
-                return GetWriteBarrierForm(comp, funcApp.GetArg(0));
-            }
-        }
-    }
-    return GCInfo::WriteBarrierForm::WBF_BarrierUnknown;
-}
-
-//------------------------------------------------------------------------
-// fgValueNumberStoreIndWriteBarrier: This function assists gcIsWriteBarrierCandidate using conservative
-//    VNs. Record the result before CSE can "hide" addresses/values under locals, making it impossible for
-//    gcIsWriteBarrierCandidate to determine the exact type of write barrier required
-//    (it's too late for it to rely on VNs).
-//
-//    There are three cases we handle here:
-//     * Target is not on the heap - no write barrier is required
-//     * Target could be on the heap, but the value being stored doesn't require any write barrier
-//     * Target is definitely on the heap - checked (slower) write barrier is not required
-//
-// Arguments:
-//    indir      - The STOREIND node
-//
-// Notes:
-//    Records the barrier classification on the STOREIND node.
-//
-void Compiler::fgValueNumberStoreIndWriteBarrier(GenTreeStoreInd* indir)
-{
-    const GenTree* value = indir->AsIndir()->Data();
-    const GenTree* addr  = indir->AsIndir()->Addr();
-
-    if (!indir->TypeIs(TYP_REF) || !value->TypeIs(TYP_REF) || ((indir->gtFlags & GTF_IND_TGT_NOT_HEAP) != 0))
-    {
-        return;
-    }
-
-    GCInfo::WriteBarrierForm barrierType = GCInfo::WriteBarrierForm::WBF_BarrierUnknown;
-
-    // First, analyze the value being stored
-    auto vnVisitor = [this](ValueNum vn) -> ValueNumStore::VNVisit {
-        if ((vn == ValueNumStore::VNForNull()) || vnStore->IsVNObjHandle(vn))
-        {
-            // No write barrier is required for null or nongc object handles as values
-            return ValueNumStore::VNVisit::Continue;
-        }
-        return ValueNumStore::VNVisit::Abort;
-    };
-
-    if (vnStore->VNVisitReachingVNs(vnStore->VNConservativeNormalValue(value->gtVNPair), vnVisitor) ==
-        ValueNumStore::VNVisit::Continue)
-    {
-        barrierType = GCInfo::WriteBarrierForm::WBF_NoBarrier;
-    }
-    // Next, analyze the address if we haven't already determined the barrier type from the value
-    else if ((indir->gtFlags & GTF_IND_TGT_HEAP) == 0)
-    {
-        // NOTE: we might want to inspect indirs with GTF_IND_TGT_HEAP flag as well - what if we can prove
-        // that they actually need no barrier? But that comes with a TP regression.
-        barrierType = GetWriteBarrierForm(this, vnStore->VNConservativeNormalValue(addr->gtVNPair));
-    }
-
-    JITDUMP("Trying to determine the exact type of write barrier for STOREIND [%d06]: ", dspTreeID(indir));
-    if (barrierType == GCInfo::WriteBarrierForm::WBF_NoBarrier)
-    {
-        JITDUMP("is not needed at all.\n");
-        indir->gtFlags |= GTF_IND_TGT_NOT_HEAP;
-        return;
-    }
-    if (barrierType == GCInfo::WriteBarrierForm::WBF_BarrierUnchecked)
-    {
-        JITDUMP("unchecked is fine.\n");
-        indir->gtFlags |= GTF_IND_TGT_HEAP;
-        return;
-    }
-
-    JITDUMP("unknown (checked).\n");
-    return;
-}
-
-//------------------------------------------------------------------------
-// fgValueNumberStoreBlkWriteBarrier: The STORE_BLK counterpart of
-//    fgValueNumberStoreIndWriteBarrier. For block stores that contain GC
-//    pointers, attempt to prove via VN analysis that the destination
-//    address is not on the GC heap (or always on the heap).
-//
-// Arguments:
-//    store      - The STORE_BLK node
-//
-// Notes:
-//    Records the barrier classification on the STOREBLK node.
-//
-void Compiler::fgValueNumberStoreBlkWriteBarrier(GenTreeBlk* store)
-{
-    if (!store->GetLayout()->HasGCPtr() || ((store->gtFlags & (GTF_IND_TGT_NOT_HEAP | GTF_IND_TGT_HEAP)) != 0))
-    {
-        return;
-    }
-
-    GCInfo::WriteBarrierForm barrierType =
-        GetWriteBarrierForm(this, vnStore->VNConservativeNormalValue(store->Addr()->gtVNPair));
-    if (barrierType == GCInfo::WriteBarrierForm::WBF_NoBarrier)
-    {
-        JITDUMP("Add GTF_IND_TGT_NOT_HEAP to STORE_BLK [%06d]: ", dspTreeID(store));
-        store->gtFlags |= GTF_IND_TGT_NOT_HEAP;
-        return;
-    }
-    if (barrierType == GCInfo::WriteBarrierForm::WBF_BarrierUnchecked)
-    {
-        JITDUMP("Add GTF_IND_TGT_HEAP to STORE_BLK [%06d]: ", dspTreeID(store));
-        store->gtFlags |= GTF_IND_TGT_HEAP;
-        return;
-    }
-    return;
-}
-
-//------------------------------------------------------------------------
 // fgValueNumberStore: Does value numbering for a store.
 //
 // While this method does indeed give a VN to the store tree itself, its
@@ -13351,7 +13169,7 @@ void Compiler::fgValueNumberStore(GenTree* store)
     // null check: this fact says nothing about whether the destination is valid.
     if ((vnKnownNullValues != nullptr) && store->OperIs(GT_STOREIND) && store->TypeIs(TYP_REF) &&
         value->TypeIs(TYP_REF) && ((store->gtFlags & GTF_IND_TGT_NOT_HEAP) == 0) &&
-        fgVNFactIsAvailable(vnKnownNullValues, valueVNPair.GetConservative(), compCurBB, false))
+        fgVNGetFactAnchor(vnKnownNullValues, valueVNPair.GetConservative(), compCurBB, false))
     {
         store->gtFlags |= GTF_IND_TGT_NOT_HEAP;
         JITDUMP("Null-edge fact removes write barrier on [%06u]\n", dspTreeID(store));
@@ -16123,13 +15941,13 @@ void Compiler::fgValueNumberAddExceptionSetForIndirection(GenTree* tree, GenTree
     // The two sides usually share a base, then the item is looked up and recorded once.
     ValueNumPair excChkSet = vnStore->VNPForEmptyExcSet();
     ValueNum     itemL     = ValueNumStore::NoVN;
-    bool         survivedL = false;
-    bool         survivedC = false;
+    BasicBlock*  anchorL   = nullptr;
+    BasicBlock*  anchorC   = nullptr;
     if (!vnStore->IsKnownNonNull(baseLVN))
     {
-        itemL     = vnStore->VNForFunc(TYP_REF, VNF_NullPtrExc, baseLVN);
-        survivedL = fgVNSurvivedException(itemL);
-        if (!survivedL)
+        itemL   = vnStore->VNForFunc(TYP_REF, VNF_NullPtrExc, baseLVN);
+        anchorL = fgVNSurvivedException(itemL);
+        if (anchorL == nullptr)
         {
             excChkSet.SetLiberal(vnStore->VNExcSetSingleton(itemL));
         }
@@ -16140,8 +15958,8 @@ void Compiler::fgValueNumberAddExceptionSetForIndirection(GenTree* tree, GenTree
         // can nevertheless establish a conservative fact reused through an SSA local.
         if ((baseCVN == baseLVN) && (itemL != ValueNumStore::NoVN))
         {
-            survivedC = survivedL;
-            if (!survivedL)
+            anchorC = anchorL;
+            if (anchorL == nullptr)
             {
                 excChkSet.SetConservative(vnStore->VNExcSetSingleton(itemL));
             }
@@ -16149,9 +15967,11 @@ void Compiler::fgValueNumberAddExceptionSetForIndirection(GenTree* tree, GenTree
         else
         {
             ValueNum itemC = vnStore->VNForFunc(TYP_REF, VNF_NullPtrExc, baseCVN);
-            survivedC      = vnHasConservativeBranchFacts && (vnSurvivedExceptions->LookupPointer(itemC) != nullptr) &&
-                        fgVNSurvivedException(itemC);
-            if (!survivedC)
+            if (vnHasConservativeBranchFacts && (vnSurvivedExceptions->LookupPointer(itemC) != nullptr))
+            {
+                anchorC = fgVNSurvivedException(itemC);
+            }
+            if (anchorC == nullptr)
             {
                 excChkSet.SetConservative(vnStore->VNExcSetSingleton(itemC));
             }
@@ -16163,209 +15983,18 @@ void Compiler::fgValueNumberAddExceptionSetForIndirection(GenTree* tree, GenTree
     if ((excChkSet.GetConservative() == ValueNumStore::VNForEmptyExcSet()) && tree->OperIsIndirOrArrMetaData())
     {
         tree->gtFlags |= GTF_IND_NONFAULTING;
-        if (survivedC)
+        if (anchorC != nullptr)
         {
             // This proof is contextual: the load must remain after the check it relies on.
+            // Record where the check is, unless something else already pins the load.
+            if ((tree->gtFlags & GTF_ORDER_SIDEEFF) == 0)
+            {
+                fgVNRecordExceptionDependency(tree, anchorC);
+            }
             tree->SetHasOrderingSideEffect();
         }
         fgVNUpdatedSideEffects = true;
     }
-}
-
-//--------------------------------------------------------------------------------
-// fgVNRecordNullBranchFacts: Record null and non-null facts established on branch edges.
-//
-// Arguments:
-//    block - the block whose trees have just been value numbered
-//
-void Compiler::fgVNRecordNullBranchFacts(BasicBlock* block)
-{
-    if (!block->KindIs(BBJ_COND) || (block->GetTrueTarget() == block->GetFalseTarget()))
-    {
-        return;
-    }
-
-    GenTree* cond = block->lastStmt()->GetRootNode()->gtGetOp1();
-    if (!cond->OperIs(GT_EQ, GT_NE))
-    {
-        return;
-    }
-
-    GenTree* value = cond->gtGetOp1();
-    GenTree* zero  = cond->gtGetOp2();
-    if (value->IsIntegralConst(0))
-    {
-        std::swap(value, zero);
-    }
-    if (!zero->IsIntegralConst(0) || !value->TypeIs(TYP_REF) || !value->gtVNPair.BothDefined())
-    {
-        return;
-    }
-
-    auto edgeEstablishesFact = [this, block](BasicBlock* successor) {
-        if ((successor == block) || (successor == fgFirstBB) || !m_dfsTree->Contains(successor))
-        {
-            return false;
-        }
-
-        // A fact about one edge is a fact at the successor only if every entry takes
-        // that edge. Include exceptional entries, just as the join proof does.
-        FlowEdge* preds = BlockDominancePreds(successor);
-        if (preds == nullptr)
-        {
-            return false;
-        }
-        for (FlowEdge* edge = preds; edge != nullptr; edge = edge->getNextPredEdge())
-        {
-            BasicBlock* pred = edge->getSourceBlock();
-            if (m_dfsTree->Contains(pred) && (pred != block))
-            {
-                return false;
-            }
-        }
-
-        return true;
-    };
-
-    BasicBlock* successor = cond->OperIs(GT_NE) ? block->GetTrueTarget() : block->GetFalseTarget();
-    if (edgeEstablishesFact(successor))
-    {
-        ValueNum valueVN = vnStore->VNNormalValue(value->GetVN(VNK_Liberal));
-        if (!vnStore->IsKnownNonNull(valueVN))
-        {
-            fgVNSurvivedException(vnStore->VNForFunc(TYP_REF, VNF_NullPtrExc, valueVN), successor);
-            JITDUMP("Non-null branch fact for " FMT_VN " at " FMT_BB "\n", valueVN, successor->bbNum);
-        }
-        ValueNum conservativeVN = vnStore->VNNormalValue(value->GetVN(VNK_Conservative));
-        if ((conservativeVN != valueVN) && !vnStore->IsKnownNonNull(conservativeVN))
-        {
-            fgVNSurvivedException(vnStore->VNForFunc(TYP_REF, VNF_NullPtrExc, conservativeVN), successor);
-            vnHasConservativeBranchFacts = true;
-            JITDUMP("Conservative non-null branch fact for " FMT_VN " at " FMT_BB "\n", conservativeVN,
-                    successor->bbNum);
-        }
-    }
-
-    successor = cond->OperIs(GT_EQ) ? block->GetTrueTarget() : block->GetFalseTarget();
-    if (edgeEstablishesFact(successor))
-    {
-        ValueNum valueVN = vnStore->VNConservativeNormalValue(value->gtVNPair);
-        if (valueVN != ValueNumStore::VNForNull())
-        {
-            if (vnKnownNullValues == nullptr)
-            {
-                vnKnownNullValues = new (getAllocator(CMK_ValueNumber)) VNFactMap(getAllocator(CMK_ValueNumber));
-            }
-            fgVNFactIsAvailable(vnKnownNullValues, valueVN, successor, true);
-            JITDUMP("Null branch fact for " FMT_VN " at " FMT_BB "\n", valueVN, successor->bbNum);
-        }
-    }
-}
-
-//--------------------------------------------------------------------------------
-// fgVNSurvivedException: Whether this exception item is ruled out at the given point, and record
-//    that the current block survives it. A block one of the recorded blocks dominates adds nothing; a
-//    block dominating a recorded one takes its place; any other is a further way of reaching the item
-//    and is added. One hash lookup serves both.
-//
-// Arguments:
-//    excItemVN - the exception item
-//    block     - the point to query and record; defaults to the current block
-//
-// Return Value:
-//    True if a block that survived the item dominates the current one, or every predecessor is
-//    dominated by one, the join of a diamond.
-//
-bool Compiler::fgVNSurvivedException(ValueNum excItemVN, BasicBlock* block)
-{
-    return fgVNFactIsAvailable(vnSurvivedExceptions, excItemVN, block != nullptr ? block : compCurBB, true);
-}
-
-// Check a fact's dominance and join coverage. With record=true the caller establishes
-// the fact on normal completion. Queries do not establish facts or mutate the map.
-bool Compiler::fgVNFactIsAvailable(VNFactMap* facts, ValueNum factVN, BasicBlock* block, bool record)
-{
-    if ((facts == nullptr) || (block == nullptr) || (m_domTree == nullptr))
-    {
-        return false;
-    }
-
-    VNFactBlocks* const blocks =
-        record ? facts->LookupPointerOrAdd(factVN, VNFactBlocks()) : facts->LookupPointer(factVN);
-    if (blocks == nullptr)
-    {
-        return false;
-    }
-    if (blocks->first == nullptr)
-    {
-        if (record)
-        {
-            blocks->first = block;
-        }
-        return false;
-    }
-
-    const int count   = 1 + ((blocks->more == nullptr) ? 0 : blocks->more->Height());
-    auto      blockAt = [blocks](int i) -> BasicBlock*& {
-        return (i == 0) ? blocks->first : blocks->more->BottomRef(i - 1);
-    };
-
-    for (int i = 0; i < count; i++)
-    {
-        if (m_domTree->Dominates(blockAt(i), block))
-        {
-            return true;
-        }
-    }
-
-    // Not dominated by a survivor. A join reached only through survivors counts as one and is recorded
-    // as a survivor itself. Any other block is a further way of reaching the item. The join is judged on
-    // its dominance predecessors, so a handler counts every way the try can be left before completing.
-    FlowEdge* const domPreds    = BlockDominancePreds(block);
-    bool            joinCovered = domPreds != nullptr;
-    for (FlowEdge* edge = domPreds; edge != nullptr; edge = edge->getNextPredEdge())
-    {
-        BasicBlock* const pred = edge->getSourceBlock();
-        if (!m_dfsTree->Contains(pred))
-        {
-            continue;
-        }
-
-        bool predCovered = false;
-        for (int i = 0; i < count; i++)
-        {
-            if (m_domTree->Dominates(blockAt(i), pred))
-            {
-                predCovered = true;
-                break;
-            }
-        }
-        if (!predCovered)
-        {
-            joinCovered = false;
-            break;
-        }
-    }
-
-    if (!record)
-    {
-        return joinCovered;
-    }
-
-    for (int i = 0; i < count; i++)
-    {
-        if (m_domTree->Dominates(block, blockAt(i)))
-        {
-            blockAt(i) = block;
-            return joinCovered;
-        }
-    }
-    if (blocks->more == nullptr)
-    {
-        blocks->more = new (getAllocator(CMK_ValueNumber)) ArrayStack<BasicBlock*>(getAllocator(CMK_ValueNumber), 2);
-    }
-    blocks->more->Push(block);
-    return joinCovered;
 }
 
 //--------------------------------------------------------------------------------
@@ -16506,8 +16135,9 @@ void Compiler::fgVNNullCheckBases(GenTree* baseAddr, ValueNum* baseLVN, ValueNum
 void Compiler::fgValueNumberAddExceptionSetForDivision(GenTree* tree)
 {
     GenTreeFlags nonThrowingFlags = GTF_EMPTY;
+    BasicBlock*  orderAnchor      = nullptr;
     ValueNumPair exceptions       = fgValueNumberDivisionExceptions(tree->OperGet(), tree->gtGetOp1(), tree->gtGetOp2(),
-                                                                    TYP_UNDEF, &nonThrowingFlags);
+                                                                    TYP_UNDEF, &nonThrowingFlags, &orderAnchor);
     // Unpack, Norm,Exc for the tree's VN
     ValueNumPair vnpTreeNorm;
     ValueNumPair vnpTreeExc;
@@ -16518,6 +16148,12 @@ void Compiler::fgValueNumberAddExceptionSetForDivision(GenTree* tree)
 
     if ((nonThrowingFlags & ~tree->gtFlags) != GTF_EMPTY)
     {
+        if (((nonThrowingFlags & ~tree->gtFlags) & GTF_ORDER_SIDEEFF) != 0)
+        {
+            // Record where the dominating checks are, unless something else already pins the division.
+            assert(orderAnchor != nullptr);
+            fgVNRecordExceptionDependency(tree, orderAnchor);
+        }
         tree->gtFlags |= nonThrowingFlags;
         fgVNUpdatedSideEffects = true;
         JITDUMP("Published division exception proofs on [%06u]\n", dspTreeID(tree));
@@ -16538,8 +16174,12 @@ void Compiler::fgValueNumberAddExceptionSetForDivision(GenTree* tree)
 // Return Value:
 //    VNP representing exception set
 //
-ValueNumPair Compiler::fgValueNumberDivisionExceptions(
-    genTreeOps oper, GenTree* dividend, GenTree* divisor, var_types simdBaseType, GenTreeFlags* nonThrowingFlags)
+ValueNumPair Compiler::fgValueNumberDivisionExceptions(genTreeOps    oper,
+                                                       GenTree*      dividend,
+                                                       GenTree*      divisor,
+                                                       var_types     simdBaseType,
+                                                       GenTreeFlags* nonThrowingFlags,
+                                                       BasicBlock**  orderAnchor)
 {
     // A Divide By Zero exception may be possible.
     //
@@ -16715,15 +16355,14 @@ ValueNumPair Compiler::fgValueNumberDivisionExceptions(
     // A dominating division by the same divisor has been survived, so it is not zero here; the same
     // for overflow with the same dividend. Both are recorded for the divisions this one dominates.
     // A division that cannot raise needs no record, its operands are constants below as well.
-    auto survived = [this](ValueNum item) {
-        return fgVNSurvivedException(item);
-    };
+    BasicBlock* divZeroAnchor = nullptr;
+    BasicBlock* arithAnchor   = nullptr;
 
     if (needDivideByZeroExcLib || needDivideByZeroExcCon)
     {
-        ValueNum const divZeroL         = vnStore->VNForFunc(TYP_REF, VNF_DivideByZeroExc, vnDivisorNormLib);
-        bool const     divZeroSurvivedL = survived(divZeroL);
-        if (needDivideByZeroExcLib && !divZeroSurvivedL)
+        ValueNum const divZeroL = vnStore->VNForFunc(TYP_REF, VNF_DivideByZeroExc, vnDivisorNormLib);
+        divZeroAnchor           = fgVNSurvivedException(divZeroL);
+        if (needDivideByZeroExcLib && (divZeroAnchor == nullptr))
         {
             vnpDivZeroExc.SetLiberal(vnStore->VNExcSetSingleton(divZeroL));
         }
@@ -16732,7 +16371,7 @@ ValueNumPair Compiler::fgValueNumberDivisionExceptions(
             ValueNum const divZeroC = (vnDivisorNormCon == vnDivisorNormLib)
                                           ? divZeroL
                                           : vnStore->VNForFunc(TYP_REF, VNF_DivideByZeroExc, vnDivisorNormCon);
-            if ((divZeroC != divZeroL) || !divZeroSurvivedL)
+            if ((divZeroC != divZeroL) || (divZeroAnchor == nullptr))
             {
                 vnpDivZeroExc.SetConservative(vnStore->VNExcSetSingleton(divZeroC));
             }
@@ -16743,8 +16382,8 @@ ValueNumPair Compiler::fgValueNumberDivisionExceptions(
     {
         ValueNum const arithL =
             vnStore->VNForFuncNoFolding(TYP_REF, VNF_ArithmeticExc, vnDividendNormLib, vnDivisorNormLib);
-        bool const arithSurvivedL = survived(arithL);
-        if (needArithmeticExcLib && !arithSurvivedL)
+        arithAnchor = fgVNSurvivedException(arithL);
+        if (needArithmeticExcLib && (arithAnchor == nullptr))
         {
             vnpArithmExc.SetLiberal(vnStore->VNExcSetSingleton(arithL));
         }
@@ -16754,7 +16393,7 @@ ValueNumPair Compiler::fgValueNumberDivisionExceptions(
                 (vnDivisorNormCon == vnDivisorNormLib)
                     ? arithL
                     : vnStore->VNForFuncNoFolding(TYP_REF, VNF_ArithmeticExc, vnDividendNormLib, vnDivisorNormCon);
-            if ((arithC != arithL) || !arithSurvivedL)
+            if ((arithC != arithL) || (arithAnchor == nullptr))
             {
                 vnpArithmExc.SetConservative(vnStore->VNExcSetSingleton(arithC));
             }
@@ -16770,7 +16409,12 @@ ValueNumPair Compiler::fgValueNumberDivisionExceptions(
             *nonThrowingFlags |= GTF_DIV_MOD_NO_BY_ZERO;
             if (needDivideByZeroExcCon)
             {
+                assert(divZeroAnchor != nullptr);
                 *nonThrowingFlags |= GTF_ORDER_SIDEEFF;
+                if (orderAnchor != nullptr)
+                {
+                    *orderAnchor = divZeroAnchor;
+                }
             }
         }
 
@@ -16782,7 +16426,15 @@ ValueNumPair Compiler::fgValueNumberDivisionExceptions(
             *nonThrowingFlags |= GTF_DIV_MOD_NO_OVERFLOW;
             if (needArithmeticExcCon)
             {
+                assert(arithAnchor != nullptr);
                 *nonThrowingFlags |= GTF_ORDER_SIDEEFF;
+                // Both proofs dominate this division, so one anchor dominates the other;
+                // the dominated one is where both hold.
+                if ((orderAnchor != nullptr) &&
+                    ((*orderAnchor == nullptr) || m_domTree->Dominates(*orderAnchor, arithAnchor)))
+                {
+                    *orderAnchor = arithAnchor;
+                }
             }
         }
     }

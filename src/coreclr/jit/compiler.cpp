@@ -4764,6 +4764,10 @@ void Compiler::compCompile(void** methodCodePtr, uint32_t* methodCodeSize, JitFl
                 DoPhase(this, PHASE_HOIST_LOOP_CODE, &Compiler::optHoistLoopCode);
             }
 
+            // Following phases can replace trees and change flow. Discard VN proof provenance
+            // before those edits, including when loop hoisting was disabled or had no work.
+            fgVNClearExceptionDependencies();
+
             if (doCopyProp)
             {
                 // Perform VN based copy propagation
