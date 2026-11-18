@@ -2936,6 +2936,12 @@ regNumber LinearScan::allocateReg(Interval*                currentInterval,
 bool LinearScan::canSpillReg(RegRecord* physRegRecord, LsraLocation refLocation)
 {
     assert(physRegRecord->assignedInterval != nullptr);
+    // Check the next reference of this register's own interval.
+    if ((nextIntervalRef[physRegRecord->regNum] == refLocation) &&
+        !physRegRecord->assignedInterval->getNextRefPosition()->RegOptional())
+    {
+        return false;
+    }
     RefPosition* recentAssignedRef = physRegRecord->assignedInterval->recentRefPosition;
 
     if (recentAssignedRef != nullptr)
@@ -2951,6 +2957,41 @@ bool LinearScan::canSpillReg(RegRecord* physRegRecord, LsraLocation refLocation)
     assert(physRegRecord->assignedInterval->getLocalVar(m_compiler)->lvIsParam);
     return false;
 }
+
+#if defined(DEBUG) && defined(TARGET_ARM)
+// Test pair occupancy directly, independent of codegen.
+void LinearScan::TestRegOccupants()
+{
+    RegRecord regs[2];
+    regs[0].init(REG_F0);
+    regs[1].init(REG_F1);
+    Interval    first(TYP_FLOAT, RBM_NONE);
+    Interval    second(TYP_FLOAT, RBM_NONE);
+    RefPosition optional(1, 10, nullptr, RefTypeUse, nullptr);
+    RefPosition required(1, 10, nullptr, RefTypeUse, nullptr);
+    optional.setRegOptional(true);
+    required.setRegOptional(false);
+    first.firstRefPosition  = &optional;
+    second.firstRefPosition = &required;
+
+    for (unsigned occupied = 0; occupied < 4; occupied++)
+    {
+        regs[0].assignedInterval = (occupied & 1) != 0 ? &first : nullptr;
+        regs[1].assignedInterval = (occupied & 2) != 0 ? &second : nullptr;
+        unsigned visited         = 0;
+        bool     allowed         = allRegOccupantsSatisfy(regs, TYP_DOUBLE, [&](RegRecord* reg) {
+            visited |= 1u << (reg->regNum - REG_F0);
+            RefPosition* next = reg->assignedInterval->getNextRefPosition();
+            return (next->nodeLocation != 10) || next->RegOptional();
+        });
+        assert(visited == occupied);
+        assert(allowed == ((occupied & 2) == 0));
+        assert(allRegOccupantsSatisfy(regs, TYP_FLOAT, [&](RegRecord* reg) {
+            return reg == &regs[0];
+        }));
+    }
+}
+#endif
 
 //------------------------------------------------------------------------
 // getSpillWeight: Get the weight associated with spilling the given register
@@ -2978,33 +3019,6 @@ weight_t LinearScan::getSpillWeight(RegRecord* physRegRecord)
 }
 
 #ifdef TARGET_ARM
-//------------------------------------------------------------------------
-// canSpillDoubleReg: Determine whether we can spill physRegRecord
-//
-// Arguments:
-//    physRegRecord             - reg to spill (must be a valid double register)
-//    refLocation               - Location of RefPosition where this register will be spilled
-//
-// Return Value:
-//    True  - if we can spill physRegRecord
-//    False - otherwise
-//
-bool LinearScan::canSpillDoubleReg(RegRecord* physRegRecord, LsraLocation refLocation)
-{
-    assert(genIsValidDoubleReg(physRegRecord->regNum));
-    RegRecord* physRegRecord2 = getSecondHalfRegRec(physRegRecord);
-
-    if ((physRegRecord->assignedInterval != nullptr) && !canSpillReg(physRegRecord, refLocation))
-    {
-        return false;
-    }
-    if ((physRegRecord2->assignedInterval != nullptr) && !canSpillReg(physRegRecord2, refLocation))
-    {
-        return false;
-    }
-    return true;
-}
-
 //------------------------------------------------------------------------
 // unassignDoublePhysReg: unassign a double register (pair)
 //
@@ -3108,19 +3122,9 @@ bool LinearScan::isSpillCandidate(Interval* current, RefPosition* refPosition, R
     // (and it's not due to this reference), as checked above.
     assert(!conflictingFixedRegReference(physRegRecord->regNum, refPosition));
 
-    bool canSpill;
-#ifdef TARGET_ARM
-    if (current->registerType == TYP_DOUBLE)
-    {
-        canSpill = canSpillDoubleReg(physRegRecord, refLocation);
-    }
-    else
-#endif // TARGET_ARM
-    {
-        canSpill = canSpillReg(physRegRecord, refLocation);
-    }
-
-    return canSpill;
+    return allRegOccupantsSatisfy(physRegRecord, current->registerType, [&](RegRecord* occupant) {
+        return canSpillReg(occupant, refLocation);
+    });
 }
 
 // ----------------------------------------------------------
@@ -12895,7 +12899,7 @@ void LinearScan::RegisterSelection::try_BEST_FIT()
         bestFitCandidates ^= bestFitCandidateBit;
 
         // Find the next RefPosition of the register.
-        LsraLocation nextIntervalLocation = linearScan->getNextIntervalRef(bestFitCandidateRegNum, regType);
+        LsraLocation nextIntervalLocation = linearScan->getNextIntervalRefLocation(bestFitCandidateRegNum, regType);
         LsraLocation nextPhysRefLocation  = linearScan->getNextFixedRef(bestFitCandidateRegNum, regType);
         nextPhysRefLocation               = Min(nextPhysRefLocation, nextIntervalLocation);
         // If the nextPhysRefLocation is a fixedRef for the rangeEndRefPosition, increment it so that
@@ -13116,11 +13120,6 @@ void LinearScan::RegisterSelection::try_SPILL_COST()
         else if (assignedInterval != nullptr)
 #endif
         {
-            if ((linearScan->getNextIntervalRef(spillCandidateRegNum, regType) == thisLocation) &&
-                !assignedInterval->getNextRefPosition()->RegOptional())
-            {
-                continue;
-            }
             if (!linearScan->isSpillCandidate(currentInterval, refPosition, spillCandidateRegRecord))
             {
                 continue;
@@ -13226,7 +13225,7 @@ void LinearScan::RegisterSelection::try_FAR_NEXT_REF()
 
         // Find the next RefPosition of the register.
         LsraLocation nextIntervalLocation =
-            linearScan->getNextIntervalRef(farthestCandidateRegNum, currentInterval->registerType);
+            linearScan->getNextIntervalRefLocation(farthestCandidateRegNum, currentInterval->registerType);
         LsraLocation nextPhysRefLocation = Min(linearScan->nextFixedRef[farthestCandidateRegNum], nextIntervalLocation);
         if (nextPhysRefLocation == farthestLocation)
         {
@@ -13393,8 +13392,8 @@ void LinearScan::RegisterSelection::calculateCoversSets()
         if (!found)
         {
             // Find the next RefPosition of the register.
-            LsraLocation nextIntervalLocation    = linearScan->getNextIntervalRef(coversCandidateRegNum, regType);
-            LsraLocation nextPhysRefLocation     = linearScan->getNextFixedRef(coversCandidateRegNum, regType);
+            LsraLocation nextIntervalLocation = linearScan->getNextIntervalRefLocation(coversCandidateRegNum, regType);
+            LsraLocation nextPhysRefLocation  = linearScan->getNextFixedRef(coversCandidateRegNum, regType);
             LsraLocation coversCandidateLocation = Min(nextPhysRefLocation, nextIntervalLocation);
 
             // If the nextPhysRefLocation is a fixedRef for the rangeEndRefPosition, increment it so that

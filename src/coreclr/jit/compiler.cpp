@@ -19,6 +19,9 @@ XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX
 #include "valuenum.h"
 #include "rangecheck.h"
 #include "lower.h"
+#if defined(DEBUG) && defined(TARGET_ARM)
+#include "lsra.h"
+#endif
 #include "stacklevelsetter.h"
 #include "patchpointinfo.h"
 #include "fgprofilesynthesis.h"
@@ -1744,6 +1747,9 @@ void Compiler::compDoComponentUnitTestsOnce()
     {
         DidComponentUnitTests = true;
         ValueNumStore::RunTests(this);
+#ifdef TARGET_ARM
+        LinearScan::TestRegOccupants();
+#endif
         BitSetSupport::TestSuite(getAllocatorDebugOnly());
     }
 }

@@ -623,6 +623,9 @@ public:
     // This could use further abstraction.  From Compiler we need the tree,
     // the flowgraph and the allocator.
     LinearScan(Compiler* theCompiler);
+#if defined(DEBUG) && defined(TARGET_ARM)
+    static void TestRegOccupants();
+#endif
 
     // This is the main driver
     virtual PhaseStatus doRegisterAllocation();
@@ -1008,9 +1011,33 @@ private:
     RegRecord* getSecondHalfRegRec(RegRecord* regRec);
     RegRecord* findAnotherHalfRegRec(RegRecord* regRec);
     regNumber  findAnotherHalfRegNum(regNumber regNum);
-    bool       canSpillDoubleReg(RegRecord* physRegRecord, LsraLocation refLocation);
     void       unassignDoublePhysReg(RegRecord* doubleRegRecord);
 #endif
+    // Apply the predicate to each occupied register, including both halves of an ARM32 double.
+    template <typename Predicate>
+    static bool allRegOccupantsSatisfy(RegRecord* first, RegisterType type, Predicate predicate)
+    {
+#ifdef TARGET_ARM
+        assert((type != TYP_DOUBLE) || genIsValidDoubleReg(first->regNum));
+#endif
+        if ((first->assignedInterval != nullptr) && !predicate(first))
+        {
+            return false;
+        }
+#ifdef TARGET_ARM
+        if (type == TYP_DOUBLE)
+        {
+            RegRecord* second = first + 1;
+            assert(second->regNum == REG_NEXT(first->regNum));
+            if ((second->assignedInterval != nullptr) && !predicate(second))
+            {
+                return false;
+            }
+        }
+#endif
+        return true;
+    }
+
     void     clearAssignedInterval(RegRecord* reg ARM_ARG(RegisterType regType));
     void     updateAssignedInterval(RegRecord* reg, Interval* interval ARM_ARG(RegisterType regType));
     void     updatePreviousInterval(RegRecord* reg, Interval* interval ARM_ARG(RegisterType regType));
@@ -1852,7 +1879,9 @@ private:
     }
 
     LsraLocation nextIntervalRef[REG_COUNT];
-    LsraLocation getNextIntervalRef(regNumber regNum, var_types regType)
+    // Earliest interval reference, including either half of an ARM32 double.
+    // Use allRegOccupantsSatisfy to inspect the corresponding intervals.
+    LsraLocation getNextIntervalRefLocation(regNumber regNum, var_types regType)
     {
         LsraLocation loc = nextIntervalRef[regNum];
 #ifdef TARGET_ARM
